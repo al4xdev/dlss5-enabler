@@ -34,8 +34,8 @@ logger = get_logger("install")
 def build_install_pipeline() -> PipelineRunner:
     steps: Sequence[PipelineStep] = [
         StepValidateTarget(),
-        StepCleanPreviousInstall(),
         StepFetchUpstream(),
+        StepCleanPreviousInstall(),
         StepInstallReShade(),
         StepInstallD3D9Translation(),
         StepInjectFeederAndHeaders(),
@@ -59,6 +59,28 @@ def run_install(
     verbose: bool = False,
 ) -> bool:
     game_exe = Path(game_exe_path).resolve()
+    with resource_lock(game_exe.parent / ".dlss5-enabler-install-operation"):
+        return _run_install_unlocked(
+            game_exe,
+            install_lumenite=install_lumenite,
+            d3d9_translate=d3d9_translate,
+            opengl=opengl,
+            install_vulkan_layer=install_vulkan_layer,
+            force_download=force_download,
+            verbose=verbose,
+        )
+
+
+def _run_install_unlocked(
+    game_exe_path: Path | str,
+    install_lumenite: bool = True,
+    d3d9_translate: bool = False,
+    opengl: bool = False,
+    install_vulkan_layer: bool = False,
+    force_download: bool = False,
+    verbose: bool = False,
+) -> bool:
+    game_exe = Path(game_exe_path).resolve()
     ctx = PipelineContext(
         game_exe=game_exe,
         install_lumenite=install_lumenite,
@@ -69,5 +91,4 @@ def run_install(
         verbose=verbose,
     )
     runner = build_install_pipeline()
-    with resource_lock(game_exe.parent / ".dlss5-enabler-install-operation"):
-        return runner.run(ctx)
+    return runner.run(ctx)

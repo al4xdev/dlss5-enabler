@@ -1,6 +1,6 @@
 [project]
 name = "dlss5-enabler"
-version = "1.0.1"
+version = "1.1.0"
 description = "Transactional cross-platform installer for the DLSS5-Feeder, RenoDX, ReShade, and LumeniteFX stack"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -61,6 +61,7 @@ dependencies = [
     "typer>=0.12.0",
     "pydantic>=2.7.0",
     "py7zr>=0.21.0",
+    "packaging>=24.0",
 ]
 
 [project.urls]
@@ -81,6 +82,7 @@ dev = [
 [project.scripts]
 dlss5-enabler = "dlss5_enabler.cli:app"
 dlss5-enabler-check = "dlss5_enabler.check:main"
+dlss5-enabler-update-upstream = "dlss5_enabler.maintenance:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -106,6 +108,8 @@ warn_unreachable = true
 
 [tool.pyright]
 include = ["dlss5_enabler", "tests"]
+venvPath = "."
+venv = ".venv"
 typeCheckingMode = "strict"
 reportMissingTypeStubs = false
 reportUnknownMemberType = false

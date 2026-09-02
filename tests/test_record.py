@@ -8,6 +8,7 @@ from dlss5_enabler.core.record import (
     BinaryInfo,
     IndexEntry,
     IniTouch,
+    InstallOptions,
     InstallRecord,
     RecordedFile,
     index_add,
@@ -18,6 +19,7 @@ from dlss5_enabler.core.record import (
     record_load,
     record_save,
 )
+from dlss5_enabler.core.version import get_tool_version
 
 
 def test_models_instantiation() -> None:
@@ -85,6 +87,29 @@ def test_record_save_load_exists(tmp_path: Path) -> None:
     assert len(loaded.files) == 1
     assert loaded.files[0].path == (game_dir / "dxgi.dll").as_posix()
     assert "dxgi" in loaded.binaries
+    assert loaded.schema_version == 2
+    assert loaded.tool_version == get_tool_version()
+    assert loaded.install_options == InstallOptions()
+
+
+def test_record_load_migrates_legacy_options_in_memory(tmp_path: Path) -> None:
+    game_dir = tmp_path / "game"
+    game_dir.mkdir()
+    record_path = game_dir / "dlss5-enabler.install.json"
+    original = (
+        '{"tool_version":"1.0.0","game_exe":"game.exe","game_dir":"'
+        + game_dir.as_posix()
+        + '","lumenite_installed":false,"d3d9_translate":true,"opengl":false,"vulkan_layer":true}'
+    )
+    record_path.write_text(original, encoding="utf-8")
+
+    loaded = record_load(game_dir)
+
+    assert loaded is not None
+    assert loaded.schema_version == 1
+    assert loaded.tool_version == "1.0.0"
+    assert loaded.install_options == InstallOptions(lumenite=False, d3d9=True, opengl=False, vulkan_layer=True)
+    assert record_path.read_text(encoding="utf-8") == original
 
 
 def test_record_load_corrupted_json(tmp_path: Path) -> None:
@@ -118,6 +143,8 @@ def test_global_index_operations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     entries = index_load()
     assert len(entries) == 1
     assert entries[0].game_exe == "C:/g1/g1.exe"
+    assert entries[0].schema_version == 2
+    assert entries[0].tool_version == rec1.tool_version
 
     assert index_add(rec2)
     entries = index_load()

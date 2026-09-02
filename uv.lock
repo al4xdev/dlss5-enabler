@@ -409,11 +409,12 @@ wheels = [
 
 [[package]]
 name = "dlss5-enabler"
-version = "1.0.1"
+version = "1.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "filelock" },
     { name = "httpx" },
+    { name = "packaging" },
     { name = "py7zr" },
     { name = "pydantic" },
     { name = "rich" },
@@ -433,6 +434,7 @@ dev = [
 requires-dist = [
     { name = "filelock", specifier = ">=3.16.0" },
     { name = "httpx", specifier = ">=0.27.0" },
+    { name = "packaging", specifier = ">=24.0" },
     { name = "py7zr", specifier = ">=0.21.0" },
     { name = "pydantic", specifier = ">=2.7.0" },
     { name = "rich", specifier = ">=13.7.0" },

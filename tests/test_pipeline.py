@@ -1,3 +1,4 @@
+import struct
 import zipfile
 from pathlib import Path
 from unittest.mock import Mock
@@ -6,8 +7,17 @@ import py7zr
 import pytest
 from pytest_mock import MockerFixture
 
-from dlss5_enabler.core.pe import PeArch
-from dlss5_enabler.core.record import IniTouch, InstallRecord, RecordedFile, RegistryTouch
+from dlss5_enabler.core.pe import IMAGE_DOS_SIGNATURE, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386, PeArch
+from dlss5_enabler.core.record import (
+    IniTouch,
+    InstallOptions,
+    InstallRecord,
+    RecordedFile,
+    RegistryTouch,
+    record_load,
+    record_save,
+)
+from dlss5_enabler.network.resolver import ResolutionWarning, ResolutionWarningCode
 from dlss5_enabler.network.sources import (
     DgvoodooBundle,
     FeederBundle,
@@ -17,6 +27,7 @@ from dlss5_enabler.network.sources import (
     ReshadeBundle,
     ReshadeHeaders,
 )
+from dlss5_enabler.operations.install import build_install_pipeline, run_install
 from dlss5_enabler.operations.pipeline import PipelineContext, PipelineRunner, PipelineStep
 from dlss5_enabler.operations.reshade import (
     ensure_mv_provider_def,
@@ -35,6 +46,7 @@ from dlss5_enabler.operations.steps import (
     _place_file,
 )
 from dlss5_enabler.operations.uninstall import run_uninstall
+from dlss5_enabler.operations.update import GameUpdateStatus, run_update
 from dlss5_enabler.platform.proton import SteamPrefixInfo, WineRegParser
 
 
@@ -126,6 +138,51 @@ def _upstream_context(tmp_path: Path) -> PipelineContext:
     return ctx
 
 
+def _synthetic_pe(machine: int) -> bytes:
+    dos_header = bytearray(64)
+    struct.pack_into("<H", dos_header, 0, IMAGE_DOS_SIGNATURE)
+    struct.pack_into("<I", dos_header, 0x3C, 64)
+    file_header = bytearray(20)
+    struct.pack_into("<H", file_header, 0, machine)
+    struct.pack_into("<H", file_header, 16, 240)
+    optional_header = bytearray(240)
+    struct.pack_into("<H", optional_header, 0, 0x10B if machine == IMAGE_FILE_MACHINE_I386 else 0x20B)
+    return bytes(dos_header + b"PE\x00\x00" + file_header + optional_header)
+
+
+def _synthetic_bundles(artifacts: Path) -> dict[str, object]:
+    artifacts.mkdir()
+
+    def artifact(name: str) -> Path:
+        path = artifacts / name
+        path.write_bytes(f"synthetic:{name}".encode())
+        return path
+
+    reshade = ReshadeBundle()
+    reshade.setup_exe_path = artifact("ReShade_Setup_Addon.exe")
+    feeder = FeederBundle()
+    feeder.addon32 = artifact("dlss5-feed.addon32")
+    feeder.addon64 = artifact("dlss5-feed.addon64")
+    feeder.fx_shader = artifact("DLSS5_Feed.fx")
+    feeder.host64_exe = artifact("dlss5-feed-host64.exe")
+    renodx = RenoDxBundle()
+    renodx.addon64_path = artifact("renodx-dlss5.addon64")
+    ngx = NgxBundle()
+    ngx.nr_dll_path = artifact("nvngx_dlssnr.dll")
+    ngx.sr_dll_path = artifact("nvngx_dlss.dll")
+    headers = ReshadeHeaders()
+    headers.fxh_path = artifact("ReShade.fxh")
+    headers.ui_fxh_path = artifact("ReShadeUI.fxh")
+    headers.drawtext_path = artifact("DrawText.fxh")
+    return {
+        "fetch_reshade": reshade,
+        "fetch_feeder": feeder,
+        "fetch_renodx_dlss5": renodx,
+        "fetch_ngx_dlls": ngx,
+        "fetch_reshade_headers": headers,
+    }
+
+
 def test_pipeline_runner_success(tmp_path: Path) -> None:
     exe = tmp_path / "game.exe"
     ctx = PipelineContext(game_exe=exe)
@@ -139,12 +196,74 @@ def test_pipeline_runner_success(tmp_path: Path) -> None:
     assert not ctx.error_message
 
 
+def test_pipeline_success_summarizes_upstream_fallbacks(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    ctx = PipelineContext(game_exe=tmp_path / "game.exe")
+    ctx.upstream_warnings.append(
+        ResolutionWarning(
+            code=ResolutionWarningCode.STABLE_FALLBACK_USED,
+            component="feeder",
+            provider="github",
+            reason="latest layout was incompatible",
+            latest_revision="v2",
+            fallback_revision="v1",
+            log_path=tmp_path / "install.log",
+        )
+    )
+
+    assert PipelineRunner([DummySuccessStep()]).run(ctx)
+    output = capsys.readouterr().out
+    assert "Validated upstream fallbacks used" in output
+    assert "UPSTREAM_STABLE_FALLBACK_USED" in output
+    assert "provider=github" in output
+    assert "latest=v2" in output
+    assert "fallback=v1" in output
+
+
 def test_step_fetch_upstream_runs_every_enabled_fetch(tmp_path: Path, mocker: MockerFixture) -> None:
     fetches = _mock_upstream_fetches(mocker)
 
     assert StepFetchUpstream().execute(_upstream_context(tmp_path))
     for fetch in fetches.values():
         fetch.assert_called_once()
+
+
+def test_install_pipeline_resolves_upstreams_before_cleaning_previous_install() -> None:
+    names = tuple(step.name for step in build_install_pipeline().steps)
+
+    assert names.index("FetchUpstream") < names.index("CleanPreviousInstall")
+
+
+def test_fetch_failure_does_not_mutate_existing_installation(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    installed = tmp_path / "dxgi.dll"
+    installed.write_bytes(b"OLD_INSTALLATION")
+    ini = tmp_path / "ReShade.ini"
+    ini.write_bytes(b"OLD_INI")
+    registry = tmp_path / "user.reg"
+    registry.write_bytes(b"OLD_REGISTRY")
+    record = InstallRecord(
+        game_exe=game_exe.as_posix(),
+        game_dir=tmp_path.as_posix(),
+        files=[RecordedFile(path=installed.as_posix())],
+        ini_touched=[IniTouch(path=ini.as_posix(), section="GENERAL", key="Value", original="old")],
+        registry_touched=[
+            RegistryTouch(reg_path=registry.as_posix(), key="Software\\Wine\\DllOverrides", value_name="dxgi")
+        ],
+    )
+    record.record_path().write_bytes(record.model_dump_json().encode())
+    original = {path: path.read_bytes() for path in (installed, ini, registry, record.record_path())}
+    ctx = PipelineContext(game_exe=game_exe)
+    ctx.game_dir = tmp_path
+    ctx.reshade_dir = tmp_path
+    ctx.record = InstallRecord(game_exe=game_exe.as_posix(), game_dir=tmp_path.as_posix())
+    fetches = _mock_upstream_fetches(mocker)
+    fetches["fetch_feeder"].side_effect = RuntimeError("both upstream candidates failed")
+    clean = mocker.patch.object(StepCleanPreviousInstall, "execute")
+
+    assert not PipelineRunner([StepFetchUpstream(), StepCleanPreviousInstall()]).run(ctx)
+    clean.assert_not_called()
+    assert {path: path.read_bytes() for path in original} == original
 
 
 @pytest.mark.parametrize(
@@ -805,3 +924,174 @@ def test_run_uninstall_with_wine_overrides(tmp_path: Path, mocker: MockerFixture
     overrides = WineRegParser.read_overrides(user_reg)
     assert "dxgi" not in overrides
     assert "d3d9" in overrides
+
+
+@pytest.mark.parametrize(
+    ("machine", "architecture"),
+    [
+        (IMAGE_FILE_MACHINE_I386, "x86"),
+        (IMAGE_FILE_MACHINE_AMD64, "x64"),
+    ],
+)
+def test_synthetic_install_and_uninstall_round_trip(
+    tmp_path: Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    machine: int,
+    architecture: str,
+) -> None:
+    game_dir = tmp_path / architecture
+    game_dir.mkdir()
+    game_exe = game_dir / "game.exe"
+    game_exe.write_bytes(_synthetic_pe(machine))
+    original_executable = game_exe.read_bytes()
+    bundles = _synthetic_bundles(tmp_path / f"artifacts-{architecture}")
+    fetches = {
+        name: mocker.patch(f"dlss5_enabler.operations.steps.{name}", return_value=bundle)
+        for name, bundle in bundles.items()
+    }
+
+    def install_reshade(_setup_exe: Path, target_exe: Path, _api: str) -> bool:
+        target_exe.parent.mkdir(parents=True, exist_ok=True)
+        (target_exe.parent / "dxgi.dll").write_bytes(b"synthetic-reshade")
+        (target_exe.parent / "ReShade.ini").write_text("[GENERAL]\n", encoding="utf-8")
+        return True
+
+    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", side_effect=install_reshade)
+    mocker.patch("dlss5_enabler.operations.steps.ProtonManager.find_prefix_for_game", return_value=None)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    assert run_install(game_exe, install_lumenite=False)
+    assert (game_dir / "dxgi.dll").read_bytes() == b"synthetic-reshade"
+    assert (game_dir / f"dlss5-feed.addon{'32' if architecture == 'x86' else '64'}").is_file()
+    assert (game_dir / "reshade-shaders" / "Shaders" / "DLSS5_Feed.fx").is_file()
+    assert (game_dir / "dlss5-enabler.install.json").is_file()
+    if architecture == "x86":
+        host_dir = game_dir / "host64"
+        assert (host_dir / "dlss5-feed-host64.exe").is_file()
+        assert (host_dir / "dxgi.dll").read_bytes() == b"synthetic-reshade"
+        assert (host_dir / "renodx-dlss5.addon64").is_file()
+        assert (host_dir / "nvngx_dlssnr.dll").is_file()
+        assert (host_dir / "nvngx_dlss.dll").is_file()
+    else:
+        assert (game_dir / "renodx-dlss5.addon64").is_file()
+        assert (game_dir / "nvngx_dlssnr.dll").is_file()
+        assert (game_dir / "nvngx_dlss.dll").is_file()
+
+    assert run_install(game_exe, install_lumenite=False)
+    assert all(fetch.call_count == 2 for fetch in fetches.values())
+    assert not tuple(game_dir.rglob("*.dlss5-enabler.bak*"))
+    assert run_uninstall(game_exe)
+    assert game_exe.read_bytes() == original_executable
+    assert not (game_dir / "dxgi.dll").exists()
+    assert not (game_dir / "dlss5-enabler.install.json").exists()
+    assert not (game_dir / "host64").exists()
+
+
+@pytest.mark.parametrize(
+    ("machine", "architecture"),
+    [
+        (IMAGE_FILE_MACHINE_I386, "x86"),
+        (IMAGE_FILE_MACHINE_AMD64, "x64"),
+    ],
+)
+def test_synthetic_game_update_round_trip(
+    tmp_path: Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    machine: int,
+    architecture: str,
+) -> None:
+    game_dir = tmp_path / architecture
+    game_dir.mkdir()
+    game_exe = game_dir / "game.exe"
+    game_exe.write_bytes(_synthetic_pe(machine))
+    bundles = _synthetic_bundles(tmp_path / f"update-artifacts-{architecture}")
+    fetches = {
+        name: mocker.patch(f"dlss5_enabler.operations.steps.{name}", return_value=bundle)
+        for name, bundle in bundles.items()
+    }
+
+    def install_reshade(_setup_exe: Path, target_exe: Path, _api: str) -> bool:
+        (target_exe.parent / "dxgi.dll").write_bytes(b"synthetic-reshade")
+        (target_exe.parent / "ReShade.ini").write_text("[GENERAL]\n", encoding="utf-8")
+        return True
+
+    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", side_effect=install_reshade)
+    mocker.patch("dlss5_enabler.operations.steps.ProtonManager.find_prefix_for_game", return_value=None)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    assert run_install(game_exe, install_lumenite=False)
+    previous = record_load(game_dir)
+    assert previous is not None
+    previous.tool_version = "1.0.0"
+    previous.install_options = InstallOptions(lumenite=False)
+    assert record_save(previous)
+    mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.1.0")
+    mocker.patch("dlss5_enabler.operations.steps.get_tool_version", return_value="1.1.0")
+
+    result = run_update(game_dir)
+
+    assert result.status is GameUpdateStatus.UPDATED
+    updated = record_load(game_dir)
+    assert updated is not None
+    assert updated.tool_version == "1.1.0"
+    assert updated.schema_version == 2
+    assert updated.install_options == InstallOptions(lumenite=False)
+    assert all(fetch.call_count == 2 for fetch in fetches.values())
+    assert not tuple(game_dir.rglob("*.dlss5-enabler.bak*"))
+
+    second = run_update(game_dir)
+
+    assert second.status is GameUpdateStatus.ALREADY_CURRENT
+    assert all(fetch.call_count == 2 for fetch in fetches.values())
+
+
+def test_update_fetch_failure_preserves_existing_installation(
+    tmp_path: Path,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    game_dir = tmp_path / "game"
+    game_dir.mkdir()
+    game_exe = game_dir / "game.exe"
+    game_exe.write_bytes(_synthetic_pe(IMAGE_FILE_MACHINE_AMD64))
+    bundles = _synthetic_bundles(tmp_path / "failure-artifacts")
+    for name, bundle in bundles.items():
+        mocker.patch(f"dlss5_enabler.operations.steps.{name}", return_value=bundle)
+
+    def install_reshade(_setup_exe: Path, target_exe: Path, _api: str) -> bool:
+        (target_exe.parent / "dxgi.dll").write_bytes(b"synthetic-reshade")
+        (target_exe.parent / "ReShade.ini").write_text("[GENERAL]\n", encoding="utf-8")
+        return True
+
+    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", side_effect=install_reshade)
+    mocker.patch("dlss5_enabler.operations.steps.ProtonManager.find_prefix_for_game", return_value=None)
+    mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.1.0")
+    mocker.patch("dlss5_enabler.operations.steps.get_tool_version", return_value="1.1.0")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    assert run_install(game_exe, install_lumenite=False)
+    installed = record_load(game_dir)
+    assert installed is not None
+    installed.tool_version = "1.0.0"
+    assert record_save(installed)
+    before = {
+        path.relative_to(game_dir).as_posix(): path.read_bytes() for path in game_dir.rglob("*") if path.is_file()
+    }
+    mocker.patch("dlss5_enabler.operations.steps.fetch_feeder", side_effect=RuntimeError("offline"))
+
+    result = run_update(game_exe)
+
+    after = {path.relative_to(game_dir).as_posix(): path.read_bytes() for path in game_dir.rglob("*") if path.is_file()}
+    assert result.status is GameUpdateStatus.FAILED
+    assert after == before

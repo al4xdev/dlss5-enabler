@@ -17,12 +17,15 @@ if sys.platform == "win32":
         err_stream.reconfigure(encoding="utf-8", errors="replace")
 
 from dlss5_enabler.check import run_all_checks
-from dlss5_enabler.core.logger import get_log_dir, setup_logger
+from dlss5_enabler.core.logger import get_log_dir, get_logger, setup_logger
 from dlss5_enabler.core.pe import check_api_mismatches, detect_game_apis, detect_pe_arch
 from dlss5_enabler.core.record import index_load, record_load
 from dlss5_enabler.core.util import file_is_writable, get_cache_dir, get_permission_guidance, is_directory_writable
+from dlss5_enabler.core.version import InstallVersionStatus, get_install_version_status, get_tool_version
+from dlss5_enabler.network.update_check import UpdateCheckResult, check_for_update
 from dlss5_enabler.operations.install import run_install
 from dlss5_enabler.operations.uninstall import run_uninstall
+from dlss5_enabler.operations.update import run_update
 from dlss5_enabler.platform import ProtonManager, get_platform_adapter
 
 app: typer.Typer = typer.Typer(
@@ -31,6 +34,34 @@ app: typer.Typer = typer.Typer(
     add_completion=False,
 )
 console: Console = Console(highlight=False)
+
+
+def _version_status_markup(status: InstallVersionStatus) -> str:
+    style = {
+        InstallVersionStatus.CURRENT: "green",
+        InstallVersionStatus.UPDATE_AVAILABLE: "yellow",
+        InstallVersionStatus.NEWER_THAN_CLI: "red",
+        InstallVersionStatus.UNKNOWN_LEGACY: "magenta",
+    }[status]
+    return f"[{style}]{status.value}[/{style}]"
+
+
+def _show_update_check(result: UpdateCheckResult) -> None:
+    if result.error:
+        get_logger("update_check").debug(f"CLI update check failed: {result.error}")
+    if result.update_available and result.latest_version is not None:
+        console.print(
+            f"[bold yellow]DLSS5 Enabler {result.latest_version} is available; "
+            f"you are running {result.current_version}.[/bold yellow]\n"
+            "Update with: [cyan]uv tool upgrade dlss5-enabler[/cyan]\n"
+            "pip alternative: [cyan]python -m pip install --upgrade dlss5-enabler[/cyan]"
+        )
+
+
+def _check_cli_update(*, force: bool = False) -> UpdateCheckResult:
+    result = check_for_update(force=force)
+    _show_update_check(result)
+    return result
 
 
 def _path_size(path: Path) -> int:
@@ -111,6 +142,7 @@ def install_cmd(
     ] = False,
 ) -> None:
     setup_logger(verbose=verbose)
+    _check_cli_update()
     if d3d9 and opengl:
         console.print("[bold red]--d3d9 and --opengl cannot be used together.[/bold red]")
         raise typer.Exit(code=2)
@@ -178,23 +210,70 @@ def uninstall_cmd(
         raise typer.Exit(code=1)
 
 
+@app.command(name="update")
+def update_cmd(
+    target: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to a managed game executable (.exe) or game directory",
+            exists=True,
+            resolve_path=True,
+        ),
+    ],
+    reinstall: Annotated[
+        bool,
+        typer.Option("--reinstall", help="Reapply the saved options even when the game is current"),
+    ] = False,
+    force_download: Annotated[
+        bool,
+        typer.Option("--force-download", "-f", help="Bypass component caches during the update"),
+    ] = False,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="Enable verbose debug logging"),
+    ] = False,
+) -> None:
+    setup_logger(verbose=verbose)
+    _check_cli_update()
+    result = run_update(
+        target,
+        reinstall=reinstall,
+        force_download=force_download,
+        verbose=verbose,
+        log=console.print,
+    )
+    style = "green" if result.success else "red"
+    console.print(f"[bold {style}]{result.message}[/bold {style}]")
+    if not result.success:
+        raise typer.Exit(code=1)
+
+
 @app.command(name="list")
 def list_cmd() -> None:
+    _check_cli_update()
     entries = index_load()
     if not entries:
         console.print("[dim]No installed games found in DLSS5 Enabler index.[/dim]")
         return
 
     table = Table(title="DLSS5 Enabler Installed Games", border_style="cyan")
-    table.add_column("Executable", style="green")
-    table.add_column("Type", style="yellow")
-    table.add_column("Arch", style="magenta")
-    table.add_column("Installed At", style="dim")
+    table.add_column("Executable", style="green", no_wrap=True)
+    table.add_column("Type / Arch", style="yellow")
+    table.add_column("Version", style="cyan")
+    table.add_column("Status")
     table.add_column("Directory", style="blue")
 
+    current_version = get_tool_version()
     for e in entries:
         exe_name = Path(e.game_exe).name
-        table.add_row(exe_name, e.install_type, e.architecture, e.timestamp[:19].replace("T", " "), e.game_dir)
+        status = get_install_version_status(e.tool_version, current_version)
+        table.add_row(
+            exe_name,
+            f"{e.install_type} / {e.architecture}",
+            e.tool_version,
+            _version_status_markup(status),
+            e.game_dir,
+        )
 
     console.print(table)
 
@@ -212,6 +291,7 @@ def info_cmd(
         ),
     ],
 ) -> None:
+    _check_cli_update()
     arch = detect_pe_arch(exe)
     writable = file_is_writable(exe)
     game_dir = exe.parent
@@ -234,6 +314,20 @@ def info_cmd(
     table.add_row("DLSS5 Enabler Installed", f"[{'green' if rec else 'yellow'}]{'Yes' if rec else 'No'}[/]")
 
     if rec:
+        current_version = get_tool_version()
+        status = get_install_version_status(rec.tool_version, current_version)
+        options = rec.install_options
+        table.add_row("Installed By Version", rec.tool_version)
+        table.add_row("Current CLI Version", current_version)
+        table.add_row("Install Status", _version_status_markup(status))
+        table.add_row("Record Schema", str(rec.schema_version))
+        table.add_row(
+            "Saved Options",
+            f"Lumenite={'Yes' if options.lumenite else 'No'}, "
+            f"D3D9={'Yes' if options.d3d9 else 'No'}, "
+            f"OpenGL={'Yes' if options.opengl else 'No'}, "
+            f"Vulkan={'Yes' if options.vulkan_layer else 'No'}",
+        )
         table.add_row("Platform", rec.platform)
         table.add_row("Install Type", rec.install_type)
         table.add_row("Total Files Placed", str(len(rec.files)))
@@ -266,6 +360,20 @@ def info_cmd(
     warnings = check_api_mismatches(exe, d3d9=False, opengl=False, vulkan_layer=False)
     for w in warnings:
         console.print(f"[bold yellow][WARNING] {w}[/bold yellow]")
+
+
+@app.command(name="version")
+def version_cmd(
+    check: Annotated[bool, typer.Option("--check", help="Check PyPI now for a newer release")] = False,
+) -> None:
+    current = get_tool_version()
+    console.print(f"DLSS5 Enabler {current}")
+    if check:
+        result = _check_cli_update(force=True)
+        if result.error:
+            console.print("[yellow]Could not check PyPI for a newer version.[/yellow]")
+        elif not result.update_available and result.latest_version is not None:
+            console.print(f"Latest published version: {result.latest_version}")
 
 
 @app.command(name="cache")

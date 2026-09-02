@@ -10,6 +10,7 @@ from dlss5_enabler.core.logger import get_logger
 from dlss5_enabler.core.pe import PeArch, check_api_mismatches, detect_game_apis, detect_pe_arch
 from dlss5_enabler.core.record import (
     IniTouch,
+    InstallOptions,
     InstallRecord,
     RecordedFile,
     RegistryTouch,
@@ -26,6 +27,7 @@ from dlss5_enabler.core.util import (
     sha256_file,
     unblock_file,
 )
+from dlss5_enabler.core.version import get_tool_version
 from dlss5_enabler.network.sources import (
     fetch_dgvoodoo,
     fetch_feeder,
@@ -153,6 +155,7 @@ class StepValidateTarget(PipelineStep):
             install_type += " + Vulkan Layer"
 
         ctx.record = InstallRecord(
+            tool_version=get_tool_version(),
             game_exe=str(ctx.game_exe),
             game_dir=str(ctx.game_dir),
             architecture="x86" if ctx.is_32bit else "x64",
@@ -162,6 +165,12 @@ class StepValidateTarget(PipelineStep):
             opengl=ctx.opengl,
             vulkan_layer=ctx.install_vulkan_layer,
             lumenite_installed=ctx.install_lumenite,
+            install_options=InstallOptions(
+                lumenite=ctx.install_lumenite,
+                d3d9=ctx.d3d9_translate,
+                opengl=ctx.opengl,
+                vulkan_layer=ctx.install_vulkan_layer,
+            ),
             platform=get_platform_adapter().platform_name,
         )
 
@@ -215,38 +224,47 @@ class StepFetchUpstream(PipelineStep):
 
     def execute(self, ctx: PipelineContext) -> bool:
         dxgi = ctx.game_dir / ctx.reshade_dll_name
-        ctx.need_reshade = not dxgi.is_file()
+        previous = record_load(ctx.game_dir) if record_exists(ctx.game_dir) else None
+        ctx.need_reshade = not dxgi.is_file() or (previous is not None and previous.reshade_by_us)
 
         if ctx.need_reshade or ctx.is_32bit:
             logger.info("Fetching ReShade Addon installer...")
             ctx.reshade_bundle = fetch_reshade(logger.info, force=ctx.force_download)
             ctx.record.binaries.update(ctx.reshade_bundle.binaries)
+            ctx.upstream_warnings.extend(ctx.reshade_bundle.warnings)
 
         logger.info("Fetching DLSS5-Feeder bundle...")
         ctx.feeder_bundle = fetch_feeder(logger.info, force=ctx.force_download)
         ctx.record.binaries.update(ctx.feeder_bundle.binaries)
+        ctx.upstream_warnings.extend(ctx.feeder_bundle.warnings)
 
         logger.info("Fetching RenoDX DLSS 5 addon...")
         ctx.renodx_bundle = fetch_renodx_dlss5(logger.info, force=ctx.force_download)
         ctx.record.binaries.update(ctx.renodx_bundle.binaries)
+        ctx.upstream_warnings.extend(ctx.renodx_bundle.warnings)
 
         logger.info("Fetching DLSS Neural Rendering and SR DLLs...")
         ctx.ngx_bundle = fetch_ngx_dlls(logger.info, force=ctx.force_download)
         ctx.record.binaries.update(ctx.ngx_bundle.binaries)
+        ctx.upstream_warnings.extend(ctx.ngx_bundle.warnings)
 
         logger.info("Fetching standard ReShade shader headers...")
         ctx.headers_bundle = fetch_reshade_headers(logger.info, force=ctx.force_download)
         ctx.record.binaries.update(ctx.headers_bundle.binaries)
+        ctx.upstream_warnings.extend(ctx.headers_bundle.warnings)
 
         if ctx.d3d9_translate:
             logger.info("Fetching dgVoodoo2 bundle...")
             architecture = "x86" if ctx.is_32bit else "x64"
             ctx.dgvoodoo_bundle = fetch_dgvoodoo(logger.info, force=ctx.force_download, architecture=architecture)
             ctx.record.binaries.update(ctx.dgvoodoo_bundle.binaries)
+            ctx.upstream_warnings.extend(ctx.dgvoodoo_bundle.warnings)
 
         if ctx.install_lumenite:
             logger.info("Fetching LumeniteFX motion-vector shaders...")
             ctx.lumenite_bundle = fetch_lumenite(logger.info, force=ctx.force_download)
+            ctx.record.binaries.update(ctx.lumenite_bundle.binaries)
+            ctx.upstream_warnings.extend(ctx.lumenite_bundle.warnings)
 
         return True
 

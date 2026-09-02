@@ -12,6 +12,7 @@ from rich.console import Console
 from dlss5_enabler.core.logger import get_logger
 from dlss5_enabler.core.pe import PeArch
 from dlss5_enabler.core.record import InstallRecord
+from dlss5_enabler.network.resolver import ResolutionWarning
 from dlss5_enabler.network.sources import (
     DgvoodooBundle,
     FeederBundle,
@@ -63,6 +64,7 @@ class PipelineContext:
     error_message: str = ""
     exception: Exception | None = None
     previous_install_snapshot: InstallSnapshot | None = None
+    upstream_warnings: list[ResolutionWarning] = field(default_factory=lambda: cast(list[ResolutionWarning], []))
 
 
 class PipelineStep(ABC):
@@ -137,6 +139,10 @@ class PipelineRunner:
         console.print(
             f"\n[bold green][OK] All {len(self.steps)} pipeline stages completed in {total_duration:.2f}s![/bold green]"
         )
+        if ctx.upstream_warnings:
+            console.print("[bold yellow]Validated upstream fallbacks used:[/bold yellow]")
+            for warning in ctx.upstream_warnings:
+                console.print(f"[yellow]- {warning.render()}[/yellow]")
         for step in reversed(executed_steps):
             try:
                 step.commit(ctx)

@@ -3,10 +3,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from dlss5_enabler.core.fileio import atomic_write_text, resource_lock
 from dlss5_enabler.core.util import get_global_index_path
+from dlss5_enabler.core.version import get_tool_version
+
+CURRENT_RECORD_SCHEMA_VERSION = 2
 
 
 class RecordedFile(BaseModel):
@@ -54,8 +57,18 @@ class BinaryInfo(BaseModel):
     source_url: str = ""
 
 
+class InstallOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lumenite: bool = True
+    d3d9: bool = False
+    opengl: bool = False
+    vulkan_layer: bool = False
+
+
 class InstallRecord(BaseModel):
-    tool_version: str = "1.0.0"
+    schema_version: int = Field(default=CURRENT_RECORD_SCHEMA_VERSION, ge=1, le=CURRENT_RECORD_SCHEMA_VERSION)
+    tool_version: str = Field(default_factory=get_tool_version)
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     game_exe: str
     game_dir: str
@@ -68,12 +81,30 @@ class InstallRecord(BaseModel):
     reshade_by_us: bool = False
     vulkan_layer: bool = False
     lumenite_installed: bool = True
+    install_options: InstallOptions = Field(default_factory=InstallOptions)
     platform: str = "windows"
     proton_prefix: str = ""
     binaries: dict[str, BinaryInfo] = Field(default_factory=lambda: cast(dict[str, BinaryInfo], {}))
     files: list[RecordedFile] = Field(default_factory=lambda: cast(list[RecordedFile], []))
     ini_touched: list[IniTouch] = Field(default_factory=lambda: cast(list[IniTouch], []))
     registry_touched: list[RegistryTouch] = Field(default_factory=lambda: cast(list[RegistryTouch], []))
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_install_options(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = cast(dict[str, object], value)
+        if data.get("install_options") is not None:
+            return data
+        migrated: dict[str, object] = dict(data)
+        migrated["install_options"] = {
+            "lumenite": migrated.get("lumenite_installed", True),
+            "d3d9": migrated.get("d3d9_translate", False),
+            "opengl": migrated.get("opengl", False),
+            "vulkan_layer": migrated.get("vulkan_layer", False),
+        }
+        return migrated
 
     @field_validator("game_exe", "game_dir", "reshade_dir", "proton_prefix", mode="before")
     @classmethod
@@ -93,7 +124,8 @@ class IndexEntry(BaseModel):
     timestamp: str
     architecture: str = "x64"
     install_type: str = "D3D11/D3D12"
-    tool_version: str = "1.0.0"
+    schema_version: int = 1
+    tool_version: str = Field(default_factory=get_tool_version)
 
     @field_validator("game_exe", "game_dir", mode="before")
     @classmethod
@@ -117,7 +149,12 @@ def record_load(game_dir: Path | str) -> InstallRecord | None:
         return None
     try:
         content = p.read_text(encoding="utf-8")
-        return InstallRecord.model_validate_json(content)
+        raw: Any = json.loads(content)
+        if not isinstance(raw, dict):
+            return None
+        data = cast(dict[str, Any], raw)
+        data.setdefault("schema_version", 1)
+        return InstallRecord.model_validate(data)
     except Exception:
         return None
 
@@ -174,6 +211,7 @@ def index_add(rec: InstallRecord) -> bool:
                     timestamp=rec.timestamp,
                     architecture=rec.architecture,
                     install_type=rec.install_type,
+                    schema_version=rec.schema_version,
                     tool_version=rec.tool_version,
                 )
             )
