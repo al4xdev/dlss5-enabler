@@ -12,6 +12,12 @@ from dlss5_enabler.core.archive import safe_archive_destination
 from dlss5_enabler.core.fileio import atomic_write_bytes, atomic_write_text, resource_lock
 from dlss5_enabler.core.record import BinaryInfo
 from dlss5_enabler.core.util import get_cache_dir, sha256_file
+from dlss5_enabler.network.adapters import (
+    DownloadSourceAdapter,
+    SourceAsset,
+    get_download_source_adapter,
+    validate_download_url,
+)
 from dlss5_enabler.network.http import http_download_file, http_get_json, http_get_text
 
 LogFn = Callable[[str], None]
@@ -21,6 +27,10 @@ ProgressFn = Callable[[int, int], None]
 def _version_key(value: str) -> tuple[int, ...]:
     numbers = tuple(int(part) for part in re.findall(r"\d+", value))
     return numbers or (0,)
+
+
+def _github() -> DownloadSourceAdapter:
+    return get_download_source_adapter("github", http_get_json)
 
 
 def _cached_download(
@@ -50,16 +60,6 @@ def _cached_download(
             metadata = {"url": url, "revision": revision, "sha256": sha256_file(dest)}
             atomic_write_text(metadata_path, json.dumps(metadata, sort_keys=True))
     return dest
-
-
-def _branch_revision(repository: str, branch: str) -> str:
-    try:
-        raw: Any = http_get_json(f"https://api.github.com/repos/{repository}/commits/{branch}")
-        data = cast(dict[str, Any], raw)
-        sha = str(data.get("sha", ""))
-        return sha or branch
-    except Exception:
-        return branch
 
 
 def zip_extract_matching(
@@ -96,6 +96,15 @@ def zip_extract_matching(
     return extracted
 
 
+def zip_has_matching(zip_path: Path | str, patterns: list[str]) -> bool:
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        return any(
+            any(fnmatch(info.filename.replace("\\", "/").lower(), pattern.lower()) for pattern in patterns)
+            for info in zf.infolist()
+            if not info.is_dir()
+        )
+
+
 class FeederBundle:
     def __init__(self) -> None:
         self.release_tag: str = ""
@@ -109,60 +118,74 @@ class FeederBundle:
 
 def fetch_feeder(log: LogFn, progress: ProgressFn | None = None, force: bool = False) -> FeederBundle:
     out: FeederBundle = FeederBundle()
-    base_url: str = "https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest/download"
     cache_dir: Path = get_cache_dir()
-
-    try:
-        raw_json: Any = http_get_json("https://api.github.com/repos/jlrouzies-fr/DLSS5-Feeder/releases/latest")
-        j: dict[str, Any] = cast(dict[str, Any], raw_json)
-        out.release_tag = str(j.get("tag_name", "latest"))
-    except Exception:
-        out.release_tag = "latest"
-
+    release = _github().latest_release("jlrouzies-fr/DLSS5-Feeder")
+    out.release_tag = release.tag
     log(f"DLSS5-Feeder release: {out.release_tag}")
+    required_names = (
+        "dlss5-feed.addon64",
+        "dlss5-feed.addon32",
+        "DLSS5_Feed.fx",
+        "dlss5-feed-host64.exe",
+    )
+    bundle_asset = release.find_asset(("DLSS5-Feeder-*.zip", "DLSS5-Feeder.zip"))
+    paths: dict[str, Path] = {}
+    source_urls: dict[str, str] = {}
+    embedded_vulkan_archive: Path | None = None
+    if bundle_asset is not None:
+        archive_path = cache_dir / "DLSS5-Feeder.zip"
+        if force or not archive_path.exists():
+            log(f"  Downloading {bundle_asset.name}...")
+        _cached_download(archive_path, bundle_asset.url, release.tag, progress, force)
+        patterns = [f"*{name}" for name in (*required_names, "feed-vk-layer.zip")]
+        extracted = zip_extract_matching(archive_path, cache_dir, patterns, flatten=True)
+        paths = {path.name.lower(): path for path in extracted}
+        missing = [name for name in required_names if name.lower() not in paths]
+        if missing:
+            raise RuntimeError(f"DLSS5-Feeder release {release.tag} archive is missing: {', '.join(missing)}")
+        source_urls = {name.lower(): bundle_asset.url for name in required_names}
+        if "feed-vk-layer.zip" in paths:
+            source_urls["feed-vk-layer.zip"] = bundle_asset.url
+        elif zip_has_matching(archive_path, ["layer-x64/*", "layer-x86/*"]):
+            embedded_vulkan_archive = archive_path
+            source_urls["feed-vk-layer.zip"] = bundle_asset.url
+    else:
+        assets: dict[str, SourceAsset] = {}
+        for name in required_names:
+            assets[name.lower()] = release.require_asset((name,), f"DLSS5-Feeder {name}")
+        optional_vulkan = release.find_asset(("feed-vk-layer.zip",))
+        if optional_vulkan is not None:
+            assets[optional_vulkan.name.lower()] = optional_vulkan
+        for name, asset in assets.items():
+            dest = cache_dir / asset.name
+            if force or not dest.exists():
+                log(f"  Downloading {asset.name}...")
+            _cached_download(dest, asset.url, release.tag, progress, force)
+            paths[name] = dest
+            source_urls[name] = asset.url
 
-    files_to_dl: list[tuple[str, str]] = [
-        ("dlss5-feed.addon64", base_url + "/dlss5-feed.addon64"),
-        ("dlss5-feed.addon32", base_url + "/dlss5-feed.addon32"),
-        ("DLSS5_Feed.fx", base_url + "/DLSS5_Feed.fx"),
-        ("dlss5-feed-host64.exe", base_url + "/dlss5-feed-host64.exe"),
-    ]
-
-    for name, url in files_to_dl:
-        dest: Path = cache_dir / name
-        if force or not dest.exists():
-            log(f"  Downloading {name}...")
-        _cached_download(dest, url, out.release_tag, progress, force or out.release_tag == "latest")
-        setattr(out, name.replace(".", "_").replace("-", "_"), dest)
+    out.addon64 = paths["dlss5-feed.addon64"]
+    out.addon32 = paths["dlss5-feed.addon32"]
+    out.fx_shader = paths["dlss5_feed.fx"]
+    out.host64_exe = paths["dlss5-feed-host64.exe"]
+    out.vk_layer_zip = paths.get("feed-vk-layer.zip", embedded_vulkan_archive)
+    for name in required_names:
+        path = paths[name.lower()]
         out.binaries[name] = BinaryInfo(
             name=name,
-            version=out.release_tag,
-            sha256=sha256_file(dest),
-            size_bytes=dest.stat().st_size,
-            source_url=url,
+            version=release.tag,
+            sha256=sha256_file(path),
+            size_bytes=path.stat().st_size,
+            source_url=source_urls[name.lower()],
         )
-
-    out.addon64 = cache_dir / "dlss5-feed.addon64"
-    out.addon32 = cache_dir / "dlss5-feed.addon32"
-    out.fx_shader = cache_dir / "DLSS5_Feed.fx"
-    out.host64_exe = cache_dir / "dlss5-feed-host64.exe"
-
-    vk_dest: Path = cache_dir / "feed-vk-layer.zip"
-    vk_url: str = base_url + "/feed-vk-layer.zip"
-    try:
-        _cached_download(vk_dest, vk_url, out.release_tag, progress, force or out.release_tag == "latest")
-        if vk_dest.exists():
-            out.vk_layer_zip = vk_dest
-            out.binaries["feed-vk-layer.zip"] = BinaryInfo(
-                name="feed-vk-layer.zip",
-                version=out.release_tag,
-                sha256=sha256_file(vk_dest),
-                size_bytes=vk_dest.stat().st_size,
-                source_url=vk_url,
-            )
-    except Exception:
-        log("  feed-vk-layer.zip not published in this release (Vulkan layer unavailable).")
-
+    if out.vk_layer_zip is not None:
+        out.binaries["feed-vk-layer.zip"] = BinaryInfo(
+            name="feed-vk-layer.zip",
+            version=release.tag,
+            sha256=sha256_file(out.vk_layer_zip),
+            size_bytes=out.vk_layer_zip.stat().st_size,
+            source_url=source_urls["feed-vk-layer.zip"],
+        )
     return out
 
 
@@ -177,39 +200,26 @@ def fetch_renodx_dlss5(log: LogFn, progress: ProgressFn | None = None, force: bo
     out: RenoDxBundle = RenoDxBundle()
     log("Querying RankFTW/rhi-repo for the newest renodx-dlss5 release...")
     cache_dir: Path = get_cache_dir()
-
-    raw_data: Any = http_get_json("https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100")
-    data: list[dict[str, Any]] = cast(list[dict[str, Any]], raw_data)
-    rels: list[dict[str, str]] = []
-    for rel in data:
-        tag: str = str(rel.get("tag_name", ""))
+    releases = _github().releases("RankFTW/rhi-repo")
+    candidates: list[tuple[str, str, SourceAsset]] = []
+    for release in releases:
+        tag = release.tag
         if not tag.lower().startswith("renodx-dlss5-"):
             continue
-        assets: list[dict[str, Any]] = cast(list[dict[str, Any]], rel.get("assets", []))
-        for a in assets:
-            name: str = str(a.get("name", ""))
-            if name.lower().endswith(".zip"):
-                rels.append(
-                    {
-                        "tag": tag,
-                        "version": tag[len("renodx-dlss5-") :],
-                        "url": str(a.get("browser_download_url", "")),
-                        "name": name,
-                    }
-                )
-                break
+        asset = release.find_asset(("*.zip",))
+        if asset is not None:
+            candidates.append((tag[len("renodx-dlss5-") :], tag, asset))
 
-    if not rels:
+    if not candidates:
         raise RuntimeError("No renodx-dlss5 releases found in RankFTW/rhi-repo")
-
-    newest: dict[str, str] = max(rels, key=lambda item: _version_key(item["version"]))
-    out.version = newest["version"]
+    version, tag, asset = max(candidates, key=lambda item: _version_key(item[0]))
+    out.version = version
     log(f"renodx-dlss5 newest release: {out.version}")
 
     zip_dest: Path = cache_dir / "renodx-dlss5.zip"
     if force or not zip_dest.exists():
-        log(f"  Downloading {newest['name']}...")
-    _cached_download(zip_dest, newest["url"], newest["tag"], progress, force)
+        log(f"  Downloading {asset.name}...")
+    _cached_download(zip_dest, asset.url, tag, progress, force)
 
     extracted = zip_extract_matching(zip_dest, cache_dir, ["*renodx-dlss5.addon64"], flatten=True)
     out.addon64_path = extracted[0]
@@ -219,7 +229,7 @@ def fetch_renodx_dlss5(log: LogFn, progress: ProgressFn | None = None, force: bo
         version=out.version,
         sha256=sha256_file(out.addon64_path),
         size_bytes=out.addon64_path.stat().st_size,
-        source_url=newest["url"],
+        source_url=asset.url,
     )
     return out
 
@@ -238,7 +248,8 @@ def fetch_ngx_dlls(log: LogFn, progress: ProgressFn | None = None, force: bool =
     log("Fetching RHI dlss_manifest.json (DLSS NR / SR sources)...")
     cache_dir: Path = get_cache_dir()
 
-    raw_manifest: Any = http_get_json("https://raw.githubusercontent.com/RankFTW/RHI/main/dlss_manifest.json")
+    manifest_asset = _github().repository_file("RankFTW/RHI", "main", "dlss_manifest.json")
+    raw_manifest: Any = http_get_json(manifest_asset.url)
     manifest: dict[str, Any] = cast(dict[str, Any], raw_manifest)
 
     dlssnr_list: list[dict[str, Any]] = cast(list[dict[str, Any]], manifest.get("dlssnr", []))
@@ -252,7 +263,7 @@ def fetch_ngx_dlls(log: LogFn, progress: ProgressFn | None = None, force: bool =
     log(f"nvngx_dlssnr newest version: {out.nr_version}")
 
     nr_zip: Path = cache_dir / "nvngx_dlssnr.zip"
-    nr_url = str(best_nr["url"])
+    nr_url = validate_download_url(best_nr.get("url", ""), "nvngx_dlssnr")
     _cached_download(nr_zip, nr_url, out.nr_version, progress, force)
     out.nr_dll_path = zip_extract_matching(nr_zip, cache_dir, ["*nvngx_dlssnr.dll"], flatten=True)[0]
     out.binaries["nvngx_dlssnr.dll"] = BinaryInfo(
@@ -272,7 +283,7 @@ def fetch_ngx_dlls(log: LogFn, progress: ProgressFn | None = None, force: bool =
     log(f"nvngx_dlss newest version: {out.sr_version}")
 
     sr_zip: Path = cache_dir / "nvngx_dlss.zip"
-    sr_url = str(best_sr["url"])
+    sr_url = validate_download_url(best_sr.get("url", ""), "nvngx_dlss")
     _cached_download(sr_zip, sr_url, out.sr_version, progress, force)
     out.sr_dll_path = zip_extract_matching(sr_zip, cache_dir, ["*nvngx_dlss.dll"], flatten=True)[0]
     out.binaries["nvngx_dlss.dll"] = BinaryInfo(
@@ -336,25 +347,19 @@ def fetch_lumenite(log: LogFn, progress: ProgressFn | None = None, force: bool =
     log("Fetching LumeniteFX (motion-vector provider) from github.com/umar-afzaal/LumeniteFX...")
     cache_dir: Path = get_cache_dir()
 
-    try:
-        raw_meta: Any = http_get_json("https://api.github.com/repos/umar-afzaal/LumeniteFX")
-        meta: dict[str, Any] = cast(dict[str, Any], raw_meta)
-        out.branch = str(meta.get("default_branch", "main"))
-    except Exception:
-        out.branch = "main"
-
+    github = _github()
+    snapshot = github.repository_snapshot("umar-afzaal/LumeniteFX")
+    out.branch = snapshot.branch
     log(f"  source branch: {out.branch}")
-    revision = _branch_revision("umar-afzaal/LumeniteFX", out.branch)
-
+    archive = github.repository_archive(snapshot)
     zip_path: Path = cache_dir / "LumeniteFX.zip"
-    url: str = f"https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/{out.branch}"
-    _cached_download(zip_path, url, revision, progress, force or revision == out.branch)
+    _cached_download(zip_path, archive.url, archive.revision, progress, force)
 
-    safe_revision = re.sub(r"[^A-Za-z0-9_.-]", "_", revision)[:24]
+    safe_revision = re.sub(r"[^A-Za-z0-9_.-]", "_", archive.revision)[:24]
     staging: Path = cache_dir / f"lumenite_stage_{safe_revision}"
     marker = staging / ".complete"
     with resource_lock(staging):
-        if force or revision == out.branch or not marker.is_file():
+        if force or not marker.is_file():
             temporary = Path(tempfile.mkdtemp(prefix="lumenite-stage-", dir=cache_dir))
             try:
                 with zipfile.ZipFile(zip_path, "r") as zf:
@@ -374,7 +379,7 @@ def fetch_lumenite(log: LogFn, progress: ProgressFn | None = None, force: bool =
                             continue
                         target = safe_archive_destination(temporary, dest_rel)
                         atomic_write_bytes(target, zf.read(info))
-                atomic_write_text(temporary / ".complete", revision)
+                atomic_write_text(temporary / ".complete", archive.revision)
                 if staging.exists():
                     shutil.rmtree(staging)
                 temporary.replace(staging)
@@ -401,27 +406,19 @@ def fetch_reshade_headers(log: LogFn, progress: ProgressFn | None = None, force:
     log("Fetching standard ReShade shader headers (ReShade.fxh, ReShadeUI.fxh, DrawText.fxh)...")
     cache_dir: Path = get_cache_dir()
 
-    branch: str = "slim"
-    try:
-        raw_meta: Any = http_get_json("https://api.github.com/repos/crosire/reshade-shaders")
-        meta: dict[str, Any] = cast(dict[str, Any], raw_meta)
-        branch = str(meta.get("default_branch", "slim"))
-    except Exception:
-        branch = "slim"
-
-    revision = _branch_revision("crosire/reshade-shaders", branch)
-    base_url: str = f"https://raw.githubusercontent.com/crosire/reshade-shaders/{branch}/Shaders/"
+    github = _github()
+    snapshot = github.repository_snapshot("crosire/reshade-shaders")
     for fname in ["ReShade.fxh", "ReShadeUI.fxh", "DrawText.fxh"]:
         dest: Path = cache_dir / fname
-        url: str = base_url + fname
-        _cached_download(dest, url, revision, progress, force or revision == branch)
+        asset = github.repository_file(snapshot.repository, snapshot.revision, f"Shaders/{fname}")
+        _cached_download(dest, asset.url, asset.revision, progress, force)
         setattr(out, fname.lower().replace(".", "_") + ("_path" if not fname.lower().endswith("path") else ""), dest)
         out.binaries[fname] = BinaryInfo(
             name=fname,
-            version=revision,
+            version=asset.revision,
             sha256=sha256_file(dest),
             size_bytes=dest.stat().st_size,
-            source_url=url,
+            source_url=asset.url,
         )
 
     out.fxh_path = cache_dir / "ReShade.fxh"
@@ -451,29 +448,24 @@ def fetch_dgvoodoo(
     log("Checking github.com/dege-diosg/dgVoodoo2 for the latest release...")
     cache_dir: Path = get_cache_dir()
 
-    zip_url: str = ""
-    zip_name: str = "dgVoodoo2_87_3.zip"
-    try:
-        raw_j: Any = http_get_json("https://api.github.com/repos/dege-diosg/dgVoodoo2/releases/latest")
-        j: dict[str, Any] = cast(dict[str, Any], raw_j)
-        out.version = str(j.get("tag_name", ""))
-        assets: list[dict[str, Any]] = cast(list[dict[str, Any]], j.get("assets", []))
-        for a in assets:
-            name: str = str(a.get("name", ""))
-            lname: str = name.lower()
-            if lname.startswith("dgvoodoo2_") and lname.endswith(".zip") and "dbg" not in lname and "dev" not in lname:
-                zip_name = name
-                zip_url = str(a.get("browser_download_url", ""))
-                break
-    except Exception:
-        pass
-
-    if not zip_url:
-        zip_url = f"https://github.com/dege-diosg/dgVoodoo2/releases/latest/download/{zip_name}"
-
-    zip_path: Path = cache_dir / zip_name
-    revision = out.version or zip_name
-    _cached_download(zip_path, zip_url, revision, progress, force or not out.version)
+    release = _github().latest_release("dege-diosg/dgVoodoo2")
+    compatible_assets = [
+        asset
+        for asset in release.assets
+        if asset.name.lower().startswith("dgvoodoo2_")
+        and asset.name.lower().endswith(".zip")
+        and "dbg" not in asset.name.lower()
+        and "dev" not in asset.name.lower()
+    ]
+    if not compatible_assets:
+        published = ", ".join(asset.name for asset in release.assets) or "none"
+        raise RuntimeError(
+            f"dgVoodoo2 release {release.tag} has no compatible ZIP asset; published assets: {published}"
+        )
+    asset = compatible_assets[0]
+    out.version = release.tag
+    zip_path: Path = cache_dir / asset.name
+    _cached_download(zip_path, asset.url, release.tag, progress, force)
 
     stage = cache_dir / f"dgvoodoo_{architecture}"
     extracted_d3d9 = zip_extract_matching(zip_path, stage, [f"MS/{architecture}/D3D9.dll"], flatten=True)[0]
@@ -486,9 +478,9 @@ def fetch_dgvoodoo(
     for path in [extracted_d3d9, extracted_conf, extracted_cpl]:
         out.binaries[path.name] = BinaryInfo(
             name=path.name,
-            version=revision,
+            version=release.tag,
             sha256=sha256_file(path),
             size_bytes=path.stat().st_size,
-            source_url=zip_url,
+            source_url=asset.url,
         )
     return out

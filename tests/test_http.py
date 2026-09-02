@@ -6,7 +6,14 @@ import httpx
 import pytest
 from pytest_mock import MockerFixture
 
-from dlss5_enabler.network.http import _curl_download, create_client, http_download_file, http_get_json, http_get_text
+from dlss5_enabler.network.http import (
+    DOWNLOAD_DEADLINE_SECONDS,
+    _curl_download,
+    create_client,
+    http_download_file,
+    http_get_json,
+    http_get_text,
+)
 
 
 def test_create_client() -> None:
@@ -34,6 +41,7 @@ def test_http_get_text_success(mocker: MockerFixture) -> None:
 
 def test_http_get_text_retry_and_recover(mocker: MockerFixture) -> None:
     mock_fail = mocker.MagicMock(spec=httpx.Response)
+    mock_fail.status_code = 500
     mock_fail.raise_for_status.side_effect = httpx.HTTPStatusError(
         "500", request=mocker.MagicMock(), response=mock_fail
     )
@@ -65,6 +73,22 @@ def test_http_get_text_retries_exhausted(mocker: MockerFixture) -> None:
 
     with pytest.raises(RuntimeError, match="HTTP GET failed"):
         http_get_text("http://example.com", retries=2)
+
+
+def test_http_get_text_does_not_retry_not_found(mocker: MockerFixture) -> None:
+    response = httpx.Response(404, request=httpx.Request("GET", "https://example.com/missing"))
+    mock_client = mocker.MagicMock(spec=httpx.Client)
+    mock_client.get.return_value = response
+    mock_client.__enter__.return_value = mock_client
+    mock_client.__exit__.return_value = None
+    mocker.patch("dlss5_enabler.network.http.create_client", return_value=mock_client)
+    sleep = mocker.patch("time.sleep")
+
+    with pytest.raises(RuntimeError, match="404"):
+        http_get_text("https://example.com/missing")
+
+    assert mock_client.get.call_count == 1
+    sleep.assert_not_called()
 
 
 def test_http_get_text_custom_headers(mocker: MockerFixture) -> None:
@@ -111,6 +135,7 @@ def test_curl_download_success(tmp_path: Path, mocker: MockerFixture) -> None:
     assert "-k" not in command
     assert "-C" not in command
     assert "--fail" in command
+    assert command[command.index("-m") + 1] == str(int(DOWNLOAD_DEADLINE_SECONDS))
 
 
 def test_curl_download_failure_nonzero_exit(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -209,7 +234,7 @@ def test_http_download_file_curl_fallback(tmp_path: Path, mocker: MockerFixture)
     mocker.patch("dlss5_enabler.network.http.create_client", return_value=mock_client)
     mocker.patch("time.sleep", return_value=None)
 
-    def mock_curl(url: str, d: Path) -> bool:
+    def mock_curl(url: str, d: Path, timeout_seconds: float = DOWNLOAD_DEADLINE_SECONDS) -> bool:
         d.write_bytes(b"CURL_DOWNLOADED")
         return True
 
@@ -234,6 +259,52 @@ def test_http_download_file_total_failure(tmp_path: Path, mocker: MockerFixture)
 
     with pytest.raises(RuntimeError, match="Download failed for"):
         http_download_file("http://example.com/fail.bin", dest, retries=2)
+
+
+def test_http_download_file_does_not_retry_or_fallback_on_not_found(tmp_path: Path, mocker: MockerFixture) -> None:
+    dest = tmp_path / "missing.bin"
+    response = httpx.Response(404, request=httpx.Request("GET", "https://example.com/missing.bin"))
+    mock_client = mocker.MagicMock(spec=httpx.Client)
+    mock_client.stream.return_value.__enter__.return_value = response
+    mock_client.stream.return_value.__exit__.return_value = None
+    mock_client.__enter__.return_value = mock_client
+    mock_client.__exit__.return_value = None
+    mocker.patch("dlss5_enabler.network.http.create_client", return_value=mock_client)
+    curl = mocker.patch("dlss5_enabler.network.http._curl_download")
+    sleep = mocker.patch("time.sleep")
+
+    with pytest.raises(RuntimeError, match="404"):
+        http_download_file("https://example.com/missing.bin", dest)
+
+    assert mock_client.stream.call_count == 1
+    curl.assert_not_called()
+    sleep.assert_not_called()
+    assert not dest.exists()
+
+
+def test_http_download_file_enforces_total_deadline(tmp_path: Path, mocker: MockerFixture) -> None:
+    dest = tmp_path / "trickle.bin"
+    mock_stream_res = mocker.MagicMock()
+    mock_stream_res.raise_for_status = mocker.MagicMock()
+    mock_stream_res.headers = {"content-length": "2"}
+    mock_stream_res.iter_bytes.return_value = [b"1", b"2"]
+    mock_client = mocker.MagicMock(spec=httpx.Client)
+    mock_client.stream.return_value.__enter__.return_value = mock_stream_res
+    mock_client.stream.return_value.__exit__.return_value = None
+    mock_client.__enter__.return_value = mock_client
+    mock_client.__exit__.return_value = None
+    mocker.patch("dlss5_enabler.network.http.create_client", return_value=mock_client)
+    mocker.patch(
+        "dlss5_enabler.network.http.time.monotonic",
+        side_effect=[0.0, 1.0, 2.0, DOWNLOAD_DEADLINE_SECONDS + 1, DOWNLOAD_DEADLINE_SECONDS + 1],
+    )
+    curl = mocker.patch("dlss5_enabler.network.http._curl_download")
+
+    with pytest.raises(RuntimeError, match="exceeded"):
+        http_download_file("https://example.com/trickle.bin", dest, retries=1)
+
+    curl.assert_not_called()
+    assert not dest.exists()
 
 
 def test_http_download_failure_preserves_existing_destination(tmp_path: Path, mocker: MockerFixture) -> None:
