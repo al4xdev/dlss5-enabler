@@ -35,6 +35,7 @@ from dlss5_enabler.network.sources import (
     fetch_reshade,
     fetch_reshade_headers,
     zip_extract_matching,
+    zip_has_matching,
 )
 from dlss5_enabler.operations.pipeline import PipelineContext, PipelineStep
 from dlss5_enabler.operations.reshade import (
@@ -503,7 +504,14 @@ class StepInstallVulkanLayer(PipelineStep):
                 logger.info("Extracting Vulkan layer files...")
                 with tempfile.TemporaryDirectory(prefix="dlss5-enabler-vulkan-", dir=get_cache_dir()) as stage_name:
                     stage = Path(stage_name)
-                    vk_files = zip_extract_matching(ctx.feeder_bundle.vk_layer_zip, stage, ["*"], flatten=True)
+                    architecture = "x86" if ctx.is_32bit else "x64"
+                    architecture_patterns = [f"layer-{architecture}/*"]
+                    patterns = (
+                        architecture_patterns
+                        if zip_has_matching(ctx.feeder_bundle.vk_layer_zip, architecture_patterns)
+                        else ["*"]
+                    )
+                    vk_files = zip_extract_matching(ctx.feeder_bundle.vk_layer_zip, stage, patterns, flatten=True)
                     for source in vk_files:
                         _place_file(ctx, source, ctx.reshade_dir / source.name)
             else:

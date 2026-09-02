@@ -1,13 +1,13 @@
 [project]
 name = "dlss5-enabler"
-version = "1.0.0"
+version = "1.0.1"
 description = "Transactional cross-platform installer for the DLSS5-Feeder, RenoDX, ReShade, and LumeniteFX stack"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
-    { name = "Alex", email = "alex@users.noreply.github.com" },
+    { name = "al4xdev", email = "76815370+al4xdev@users.noreply.github.com" },
 ]
 keywords = [
     "cli",

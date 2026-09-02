@@ -1,12 +1,22 @@
 import zipfile
 from pathlib import Path
+from unittest.mock import Mock
 
 import py7zr
+import pytest
 from pytest_mock import MockerFixture
 
 from dlss5_enabler.core.pe import PeArch
 from dlss5_enabler.core.record import IniTouch, InstallRecord, RecordedFile, RegistryTouch
-from dlss5_enabler.network.sources import FeederBundle, ReshadeBundle
+from dlss5_enabler.network.sources import (
+    DgvoodooBundle,
+    FeederBundle,
+    LumeniteBundle,
+    NgxBundle,
+    RenoDxBundle,
+    ReshadeBundle,
+    ReshadeHeaders,
+)
 from dlss5_enabler.operations.pipeline import PipelineContext, PipelineRunner, PipelineStep
 from dlss5_enabler.operations.reshade import (
     ensure_mv_provider_def,
@@ -16,6 +26,7 @@ from dlss5_enabler.operations.reshade import (
 from dlss5_enabler.operations.steps import (
     StepCleanPreviousInstall,
     StepConfigureWineOverrides,
+    StepFetchUpstream,
     StepInstallReShade,
     StepInstallVulkanLayer,
     StepMirrorDualLocations,
@@ -86,6 +97,35 @@ class DummyRollbackStep(PipelineStep):
         self.rolled_back = True
 
 
+def _mock_upstream_fetches(mocker: MockerFixture) -> dict[str, Mock]:
+    bundles = {
+        "fetch_reshade": ReshadeBundle(),
+        "fetch_feeder": FeederBundle(),
+        "fetch_renodx_dlss5": RenoDxBundle(),
+        "fetch_ngx_dlls": NgxBundle(),
+        "fetch_reshade_headers": ReshadeHeaders(),
+        "fetch_dgvoodoo": DgvoodooBundle(),
+        "fetch_lumenite": LumeniteBundle(),
+    }
+    return {
+        name: mocker.patch(f"dlss5_enabler.operations.steps.{name}", return_value=bundle)
+        for name, bundle in bundles.items()
+    }
+
+
+def _upstream_context(tmp_path: Path) -> PipelineContext:
+    ctx = PipelineContext(
+        game_exe=tmp_path / "game.exe",
+        d3d9_translate=True,
+        install_lumenite=True,
+    )
+    ctx.game_dir = tmp_path
+    ctx.reshade_dir = tmp_path
+    ctx.need_reshade = True
+    ctx.record = InstallRecord(game_exe=ctx.game_exe.as_posix(), game_dir=tmp_path.as_posix())
+    return ctx
+
+
 def test_pipeline_runner_success(tmp_path: Path) -> None:
     exe = tmp_path / "game.exe"
     ctx = PipelineContext(game_exe=exe)
@@ -97,6 +137,39 @@ def test_pipeline_runner_success(tmp_path: Path) -> None:
     assert runner.run(ctx)
     assert not ctx.failed_step
     assert not ctx.error_message
+
+
+def test_step_fetch_upstream_runs_every_enabled_fetch(tmp_path: Path, mocker: MockerFixture) -> None:
+    fetches = _mock_upstream_fetches(mocker)
+
+    assert StepFetchUpstream().execute(_upstream_context(tmp_path))
+    for fetch in fetches.values():
+        fetch.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "failed_fetch",
+    (
+        "fetch_reshade",
+        "fetch_feeder",
+        "fetch_renodx_dlss5",
+        "fetch_ngx_dlls",
+        "fetch_reshade_headers",
+        "fetch_dgvoodoo",
+        "fetch_lumenite",
+    ),
+)
+def test_step_fetch_upstream_propagates_every_fetch_failure(
+    failed_fetch: str, tmp_path: Path, mocker: MockerFixture
+) -> None:
+    fetches = _mock_upstream_fetches(mocker)
+    fetches[failed_fetch].side_effect = RuntimeError(f"{failed_fetch} failed")
+
+    ctx = _upstream_context(tmp_path)
+    assert not PipelineRunner([StepFetchUpstream()]).run(ctx)
+    assert ctx.failed_step == "FetchUpstream"
+    assert ctx.error_message == f"{failed_fetch} failed"
+    fetches[failed_fetch].assert_called_once()
 
 
 def test_pipeline_runner_failure_triggers_rollback(tmp_path: Path) -> None:
@@ -580,6 +653,35 @@ def test_vulkan_install_backs_up_existing_file(tmp_path: Path) -> None:
     item = next(recorded for recorded in ctx.record.files if Path(recorded.path) == destination)
     assert destination.read_bytes() == b"NEW_LAYER"
     assert Path(item.backup).read_bytes() == b"ORIGINAL_LAYER"
+
+
+@pytest.mark.parametrize(
+    ("is_32bit", "installed", "excluded"),
+    (
+        (False, "VkLayer_feed_vk.dll", "VkLayer_feed_vk32.dll"),
+        (True, "VkLayer_feed_vk32.dll", "VkLayer_feed_vk.dll"),
+    ),
+)
+def test_vulkan_install_selects_game_architecture(
+    is_32bit: bool, installed: str, excluded: str, tmp_path: Path, mocker: MockerFixture
+) -> None:
+    archive = tmp_path / "feeder.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("layer-x64/VkLayer_feed_vk.dll", b"X64")
+        zf.writestr("layer-x86/VkLayer_feed_vk32.dll", b"X86")
+    bundle = FeederBundle()
+    bundle.vk_layer_zip = archive
+    ctx = PipelineContext(game_exe=tmp_path / "game.exe", install_vulkan_layer=True)
+    ctx.game_dir = tmp_path
+    ctx.reshade_dir = tmp_path
+    ctx.is_32bit = is_32bit
+    ctx.feeder_bundle = bundle
+    ctx.record = InstallRecord(game_exe=str(ctx.game_exe), game_dir=str(tmp_path), vulkan_layer=True)
+    mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
+
+    assert StepInstallVulkanLayer().execute(ctx)
+    assert (tmp_path / installed).is_file()
+    assert not (tmp_path / excluded).exists()
 
 
 def test_reshade_success_requires_installed_hook(tmp_path: Path, mocker: MockerFixture) -> None:
