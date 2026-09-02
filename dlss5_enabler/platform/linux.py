@@ -8,35 +8,38 @@ from dlss5_enabler.platform.base import PlatformAdapter
 
 class LinuxAdapter(PlatformAdapter):
     @staticmethod
-    def _env_path(name: str, fallback: Path) -> Path:
+    def _env_path(name: str, fallback_parts: tuple[str, ...]) -> Path:
         value = os.environ.get(name)
-        candidate = Path(value) if value else fallback
-        return candidate if candidate.is_absolute() else fallback
+        if value:
+            candidate = Path(value)
+            if candidate.is_absolute():
+                return candidate
+        return Path.home().joinpath(*fallback_parts)
 
     @property
     def platform_name(self) -> str:
         return "linux"
 
     def get_data_dir(self) -> Path:
-        base = self._env_path("XDG_DATA_HOME", Path.home() / ".local" / "share")
+        base = self._env_path("XDG_DATA_HOME", (".local", "share"))
         p = base / "dlss5-enabler"
         p.mkdir(parents=True, exist_ok=True)
         return p
 
     def get_cache_dir(self) -> Path:
-        base = self._env_path("XDG_CACHE_HOME", Path.home() / ".cache")
+        base = self._env_path("XDG_CACHE_HOME", (".cache",))
         p = base / "dlss5-enabler" / "downloads"
         p.mkdir(parents=True, exist_ok=True)
         return p
 
     def get_log_dir(self) -> Path:
-        base = self._env_path("XDG_STATE_HOME", Path.home() / ".local" / "state")
+        base = self._env_path("XDG_STATE_HOME", (".local", "state"))
         p = base / "dlss5-enabler" / "logs"
         p.mkdir(parents=True, exist_ok=True)
         return p
 
     def get_config_dir(self) -> Path:
-        base = self._env_path("XDG_CONFIG_HOME", Path.home() / ".config")
+        base = self._env_path("XDG_CONFIG_HOME", (".config",))
         p = base / "dlss5-enabler"
         p.mkdir(parents=True, exist_ok=True)
         return p

@@ -80,7 +80,7 @@ def test_record_save_load_exists(tmp_path: Path) -> None:
 
     loaded = record_load(game_dir)
     assert loaded is not None
-    assert loaded.game_exe == str(game_exe)
+    assert loaded.game_exe == game_exe.as_posix()
     assert loaded.architecture == "x64"
     assert len(loaded.files) == 1
     assert loaded.files[0].path == str(game_dir / "dxgi.dll")
