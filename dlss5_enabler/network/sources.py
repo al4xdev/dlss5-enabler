@@ -1,12 +1,14 @@
-import json
+from __future__ import annotations
+
 import re
 import shutil
 import tempfile
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from fnmatch import fnmatch
+from functools import partial
 from pathlib import Path
-from typing import Any, cast
+from urllib.parse import urlparse
 
 from dlss5_enabler.core.archive import safe_archive_destination
 from dlss5_enabler.core.fileio import atomic_write_bytes, atomic_write_text, resource_lock
@@ -14,11 +16,13 @@ from dlss5_enabler.core.record import BinaryInfo
 from dlss5_enabler.core.util import get_cache_dir, sha256_file
 from dlss5_enabler.network.adapters import (
     DownloadSourceAdapter,
+    RepositorySnapshot,
     SourceAsset,
     get_download_source_adapter,
-    validate_download_url,
 )
 from dlss5_enabler.network.http import http_download_file, http_get_json, http_get_text
+from dlss5_enabler.network.manifest import ComponentPolicy, RhiManifestEntry, RhiManifestPayload, load_upstream_manifest
+from dlss5_enabler.network.resolver import ArtifactCandidate, ResolutionWarning, ResolvedArtifact, UpstreamResolver
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int], None]
@@ -33,33 +37,53 @@ def _github() -> DownloadSourceAdapter:
     return get_download_source_adapter("github", http_get_json)
 
 
-def _cached_download(
-    dest: Path,
-    url: str,
+def _policy(component: str) -> ComponentPolicy:
+    return load_upstream_manifest().components[component]
+
+
+def _download(url: str, destination: Path | str, progress: ProgressFn | None) -> Path:
+    return http_download_file(url, destination, progress_fn=progress)
+
+
+def _resolver(log: LogFn) -> UpstreamResolver:
+    return UpstreamResolver(downloader=_download, warning_fn=lambda message: log(f"WARNING: {message}"))
+
+
+def _artifact_candidate(provider: str, asset: SourceAsset) -> ArtifactCandidate:
+    return ArtifactCandidate(
+        provider=provider,
+        revision=asset.revision,
+        name=asset.name,
+        url=asset.url,
+        sha256=asset.sha256,
+        size_bytes=asset.size_bytes,
+        asset_id=asset.asset_id,
+    )
+
+
+def _release_candidates(adapter: DownloadSourceAdapter, repository: str) -> tuple[ArtifactCandidate, ...]:
+    release = adapter.latest_release(repository)
+    return tuple(_artifact_candidate(adapter.name, asset) for asset in release.assets)
+
+
+def _repository_file_candidates(
+    adapter: DownloadSourceAdapter,
+    repository: str,
     revision: str,
-    progress: ProgressFn | None,
-    force: bool,
-) -> Path:
-    metadata_path = Path(f"{dest}.dlss5-enabler-cache.json")
-    state_lock = Path(f"{dest}.cache-state")
-    with resource_lock(state_lock):
-        valid = False
-        if not force and dest.is_file() and dest.stat().st_size > 0 and metadata_path.is_file():
-            try:
-                raw: Any = json.loads(metadata_path.read_text(encoding="utf-8"))
-                metadata = cast(dict[str, Any], raw)
-                valid = (
-                    metadata.get("url") == url
-                    and metadata.get("revision") == revision
-                    and metadata.get("sha256") == sha256_file(dest)
-                )
-            except Exception:
-                valid = False
-        if not valid:
-            http_download_file(url, dest, progress_fn=progress)
-            metadata = {"url": url, "revision": revision, "sha256": sha256_file(dest)}
-            atomic_write_text(metadata_path, json.dumps(metadata, sort_keys=True))
-    return dest
+    relative_path: str,
+) -> tuple[ArtifactCandidate, ...]:
+    asset = adapter.repository_file(repository, revision, relative_path)
+    return (_artifact_candidate(adapter.name, asset),)
+
+
+def _binary(path: Path, name: str, resolved: ResolvedArtifact) -> BinaryInfo:
+    return BinaryInfo(
+        name=name,
+        version=resolved.revision,
+        sha256=sha256_file(path),
+        size_bytes=path.stat().st_size,
+        source_url=resolved.url,
+    )
 
 
 def zip_extract_matching(
@@ -68,27 +92,25 @@ def zip_extract_matching(
     patterns: list[str],
     flatten: bool = True,
 ) -> list[Path]:
-    zpath: Path = Path(zip_path)
-    dest: Path = Path(dest_dir)
+    zpath = Path(zip_path)
+    dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
     extracted: list[Path] = []
 
-    with zipfile.ZipFile(zpath, "r") as zf:
+    with zipfile.ZipFile(zpath, "r") as archive:
         destinations: set[Path] = set()
-        for info in zf.infolist():
+        for info in archive.infolist():
             if info.is_dir():
                 continue
-            name: str = info.filename.replace("\\", "/")
-            matched: bool = any(fnmatch(name.lower(), p.lower()) for p in patterns)
-            if not matched:
+            name = info.filename.replace("\\", "/")
+            if not any(fnmatch(name.lower(), pattern.lower()) for pattern in patterns):
                 continue
-
             out_path = safe_archive_destination(dest, name, flatten=flatten)
             if out_path in destinations:
                 raise ValueError(f"Archive members collide at destination: {out_path.name}")
             destinations.add(out_path)
             with resource_lock(out_path):
-                atomic_write_bytes(out_path, zf.read(info))
+                atomic_write_bytes(out_path, archive.read(info))
             extracted.append(out_path)
 
     if not extracted:
@@ -97,10 +119,10 @@ def zip_extract_matching(
 
 
 def zip_has_matching(zip_path: Path | str, patterns: list[str]) -> bool:
-    with zipfile.ZipFile(zip_path, "r") as zf:
+    with zipfile.ZipFile(zip_path, "r") as archive:
         return any(
             any(fnmatch(info.filename.replace("\\", "/").lower(), pattern.lower()) for pattern in patterns)
-            for info in zf.infolist()
+            for info in archive.infolist()
             if not info.is_dir()
         )
 
@@ -114,13 +136,27 @@ class FeederBundle:
         self.host64_exe: Path | None = None
         self.vk_layer_zip: Path | None = None
         self.binaries: dict[str, BinaryInfo] = {}
+        self.warnings: tuple[ResolutionWarning, ...] = ()
 
 
 def fetch_feeder(log: LogFn, progress: ProgressFn | None = None, force: bool = False) -> FeederBundle:
-    out: FeederBundle = FeederBundle()
-    cache_dir: Path = get_cache_dir()
-    release = _github().latest_release("jlrouzies-fr/DLSS5-Feeder")
-    out.release_tag = release.tag
+    out = FeederBundle()
+    cache_dir = get_cache_dir()
+    policy = _policy("feeder")
+    adapter = _github()
+    repository = policy.repository
+    if repository is None:
+        raise RuntimeError("DLSS5-Feeder policy has no repository")
+    resolved = _resolver(log).resolve(
+        "feeder",
+        policy,
+        cache_dir / "DLSS5-Feeder.zip",
+        lambda: _release_candidates(adapter, repository),
+        progress=progress,
+        force=force,
+    )
+    out.release_tag = resolved.revision
+    out.warnings = resolved.warnings
     log(f"DLSS5-Feeder release: {out.release_tag}")
     required_names = (
         "dlss5-feed.addon64",
@@ -128,64 +164,28 @@ def fetch_feeder(log: LogFn, progress: ProgressFn | None = None, force: bool = F
         "DLSS5_Feed.fx",
         "dlss5-feed-host64.exe",
     )
-    bundle_asset = release.find_asset(("DLSS5-Feeder-*.zip", "DLSS5-Feeder.zip"))
-    paths: dict[str, Path] = {}
-    source_urls: dict[str, str] = {}
-    embedded_vulkan_archive: Path | None = None
-    if bundle_asset is not None:
-        archive_path = cache_dir / "DLSS5-Feeder.zip"
-        if force or not archive_path.exists():
-            log(f"  Downloading {bundle_asset.name}...")
-        _cached_download(archive_path, bundle_asset.url, release.tag, progress, force)
-        patterns = [f"*{name}" for name in (*required_names, "feed-vk-layer.zip")]
-        extracted = zip_extract_matching(archive_path, cache_dir, patterns, flatten=True)
-        paths = {path.name.lower(): path for path in extracted}
-        missing = [name for name in required_names if name.lower() not in paths]
-        if missing:
-            raise RuntimeError(f"DLSS5-Feeder release {release.tag} archive is missing: {', '.join(missing)}")
-        source_urls = {name.lower(): bundle_asset.url for name in required_names}
-        if "feed-vk-layer.zip" in paths:
-            source_urls["feed-vk-layer.zip"] = bundle_asset.url
-        elif zip_has_matching(archive_path, ["layer-x64/*", "layer-x86/*"]):
-            embedded_vulkan_archive = archive_path
-            source_urls["feed-vk-layer.zip"] = bundle_asset.url
-    else:
-        assets: dict[str, SourceAsset] = {}
-        for name in required_names:
-            assets[name.lower()] = release.require_asset((name,), f"DLSS5-Feeder {name}")
-        optional_vulkan = release.find_asset(("feed-vk-layer.zip",))
-        if optional_vulkan is not None:
-            assets[optional_vulkan.name.lower()] = optional_vulkan
-        for name, asset in assets.items():
-            dest = cache_dir / asset.name
-            if force or not dest.exists():
-                log(f"  Downloading {asset.name}...")
-            _cached_download(dest, asset.url, release.tag, progress, force)
-            paths[name] = dest
-            source_urls[name] = asset.url
-
+    extracted = zip_extract_matching(
+        resolved.path,
+        cache_dir,
+        [f"*{name}" for name in (*required_names, "feed-vk-layer.zip")],
+        flatten=True,
+    )
+    paths = {path.name.lower(): path for path in extracted}
+    missing = [name for name in required_names if name.lower() not in paths]
+    if missing:
+        raise RuntimeError(f"DLSS5-Feeder release {resolved.revision} archive is missing: {', '.join(missing)}")
     out.addon64 = paths["dlss5-feed.addon64"]
     out.addon32 = paths["dlss5-feed.addon32"]
     out.fx_shader = paths["dlss5_feed.fx"]
     out.host64_exe = paths["dlss5-feed-host64.exe"]
-    out.vk_layer_zip = paths.get("feed-vk-layer.zip", embedded_vulkan_archive)
+    out.vk_layer_zip = paths.get("feed-vk-layer.zip")
+    if out.vk_layer_zip is None and zip_has_matching(resolved.path, ["*layer-x64/*", "*layer-x86/*"]):
+        out.vk_layer_zip = resolved.path
     for name in required_names:
         path = paths[name.lower()]
-        out.binaries[name] = BinaryInfo(
-            name=name,
-            version=release.tag,
-            sha256=sha256_file(path),
-            size_bytes=path.stat().st_size,
-            source_url=source_urls[name.lower()],
-        )
+        out.binaries[name] = _binary(path, name, resolved)
     if out.vk_layer_zip is not None:
-        out.binaries["feed-vk-layer.zip"] = BinaryInfo(
-            name="feed-vk-layer.zip",
-            version=release.tag,
-            sha256=sha256_file(out.vk_layer_zip),
-            size_bytes=out.vk_layer_zip.stat().st_size,
-            source_url=source_urls["feed-vk-layer.zip"],
-        )
+        out.binaries["feed-vk-layer.zip"] = _binary(out.vk_layer_zip, "feed-vk-layer.zip", resolved)
     return out
 
 
@@ -194,43 +194,41 @@ class RenoDxBundle:
         self.version: str = ""
         self.addon64_path: Path | None = None
         self.binaries: dict[str, BinaryInfo] = {}
+        self.warnings: tuple[ResolutionWarning, ...] = ()
 
 
 def fetch_renodx_dlss5(log: LogFn, progress: ProgressFn | None = None, force: bool = False) -> RenoDxBundle:
-    out: RenoDxBundle = RenoDxBundle()
-    log("Querying RankFTW/rhi-repo for the newest renodx-dlss5 release...")
-    cache_dir: Path = get_cache_dir()
-    releases = _github().releases("RankFTW/rhi-repo")
-    candidates: list[tuple[str, str, SourceAsset]] = []
-    for release in releases:
-        tag = release.tag
-        if not tag.lower().startswith("renodx-dlss5-"):
-            continue
-        asset = release.find_asset(("*.zip",))
-        if asset is not None:
-            candidates.append((tag[len("renodx-dlss5-") :], tag, asset))
+    out = RenoDxBundle()
+    cache_dir = get_cache_dir()
+    policy = _policy("renodx_dlss5")
+    adapter = _github()
+    repository = policy.repository
+    prefix = policy.discovery.release_tag_prefix
+    if repository is None or prefix is None:
+        raise RuntimeError("RenoDX policy is incomplete")
 
-    if not candidates:
-        raise RuntimeError("No renodx-dlss5 releases found in RankFTW/rhi-repo")
-    version, tag, asset = max(candidates, key=lambda item: _version_key(item[0]))
-    out.version = version
-    log(f"renodx-dlss5 newest release: {out.version}")
+    def latest() -> Sequence[ArtifactCandidate]:
+        releases = tuple(
+            release for release in adapter.releases(repository) if release.tag.lower().startswith(prefix.lower())
+        )
+        if not releases:
+            return ()
+        release = max(releases, key=lambda item: _version_key(item.tag[len(prefix) :]))
+        return tuple(_artifact_candidate(adapter.name, asset) for asset in release.assets)
 
-    zip_dest: Path = cache_dir / "renodx-dlss5.zip"
-    if force or not zip_dest.exists():
-        log(f"  Downloading {asset.name}...")
-    _cached_download(zip_dest, asset.url, tag, progress, force)
-
-    extracted = zip_extract_matching(zip_dest, cache_dir, ["*renodx-dlss5.addon64"], flatten=True)
-    out.addon64_path = extracted[0]
-
-    out.binaries["renodx-dlss5.addon64"] = BinaryInfo(
-        name="renodx-dlss5.addon64",
-        version=out.version,
-        sha256=sha256_file(out.addon64_path),
-        size_bytes=out.addon64_path.stat().st_size,
-        source_url=asset.url,
+    resolved = _resolver(log).resolve(
+        "renodx_dlss5",
+        policy,
+        cache_dir / "renodx-dlss5.zip",
+        latest,
+        progress=progress,
+        force=force,
     )
+    out.version = resolved.revision.removeprefix(prefix)
+    out.warnings = resolved.warnings
+    log(f"renodx-dlss5 release: {out.version}")
+    out.addon64_path = zip_extract_matching(resolved.path, cache_dir, ["*renodx-dlss5.addon64"], flatten=True)[0]
+    out.binaries["renodx-dlss5.addon64"] = _binary(out.addon64_path, "renodx-dlss5.addon64", resolved)
     return out
 
 
@@ -241,59 +239,82 @@ class NgxBundle:
         self.sr_version: str = ""
         self.sr_dll_path: Path | None = None
         self.binaries: dict[str, BinaryInfo] = {}
+        self.warnings: tuple[ResolutionWarning, ...] = ()
+
+
+def _resolve_rhi_manifest(
+    log: LogFn,
+    cache_dir: Path,
+    progress: ProgressFn | None,
+    force: bool,
+) -> ResolvedArtifact:
+    policy = _policy("rhi_manifest")
+    adapter = _github()
+    repository = policy.repository
+    branch = policy.discovery.branch
+    relative_path = policy.discovery.relative_path
+    if repository is None or branch is None or relative_path is None:
+        raise RuntimeError("RHI manifest policy is incomplete")
+
+    def latest() -> Sequence[ArtifactCandidate]:
+        snapshot = adapter.repository_snapshot(repository, branch)
+        asset = adapter.repository_file(repository, snapshot.revision, relative_path)
+        return (_artifact_candidate(adapter.name, asset),)
+
+    return _resolver(log).resolve(
+        "rhi_manifest",
+        policy,
+        cache_dir / "dlss_manifest.json",
+        latest,
+        stable_name=policy.stable_artifacts[0].name,
+        progress=progress,
+        force=force,
+    )
+
+
+def _resolve_ngx(
+    component: str,
+    entry: RhiManifestEntry,
+    destination: Path,
+    log: LogFn,
+    progress: ProgressFn | None,
+    force: bool,
+) -> ResolvedArtifact:
+    policy = _policy(component)
+    name = Path(urlparse(entry.url).path).name
+    candidate = ArtifactCandidate(
+        provider=policy.provider,
+        revision=f"{policy.discovery.release_tag_prefix or ''}{entry.version}",
+        name=name,
+        url=entry.url,
+    )
+    return _resolver(log).resolve(
+        component,
+        policy,
+        destination,
+        lambda: (candidate,),
+        progress=progress,
+        force=force,
+    )
 
 
 def fetch_ngx_dlls(log: LogFn, progress: ProgressFn | None = None, force: bool = False) -> NgxBundle:
-    out: NgxBundle = NgxBundle()
-    log("Fetching RHI dlss_manifest.json (DLSS NR / SR sources)...")
-    cache_dir: Path = get_cache_dir()
-
-    manifest_asset = _github().repository_file("RankFTW/RHI", "main", "dlss_manifest.json")
-    raw_manifest: Any = http_get_json(manifest_asset.url)
-    manifest: dict[str, Any] = cast(dict[str, Any], raw_manifest)
-
-    dlssnr_list: list[dict[str, Any]] = cast(list[dict[str, Any]], manifest.get("dlssnr", []))
-    if not dlssnr_list:
-        raise RuntimeError("No dlssnr entries in dlss_manifest.json")
-
-    sf_builds: list[dict[str, Any]] = [e for e in dlssnr_list if "SF" in str(e.get("version", ""))]
-    nr_candidates = sf_builds if sf_builds else dlssnr_list
-    best_nr: dict[str, Any] = max(nr_candidates, key=lambda item: _version_key(str(item.get("version", ""))))
-    out.nr_version = str(best_nr.get("version", ""))
-    log(f"nvngx_dlssnr newest version: {out.nr_version}")
-
-    nr_zip: Path = cache_dir / "nvngx_dlssnr.zip"
-    nr_url = validate_download_url(best_nr.get("url", ""), "nvngx_dlssnr")
-    _cached_download(nr_zip, nr_url, out.nr_version, progress, force)
-    out.nr_dll_path = zip_extract_matching(nr_zip, cache_dir, ["*nvngx_dlssnr.dll"], flatten=True)[0]
-    out.binaries["nvngx_dlssnr.dll"] = BinaryInfo(
-        name="nvngx_dlssnr.dll",
-        version=out.nr_version,
-        sha256=sha256_file(out.nr_dll_path),
-        size_bytes=out.nr_dll_path.stat().st_size,
-        source_url=nr_url,
-    )
-
-    dlss_list: list[dict[str, Any]] = cast(list[dict[str, Any]], manifest.get("dlss", []))
-    if not dlss_list:
-        raise RuntimeError("No dlss entries in dlss_manifest.json")
-
-    best_sr: dict[str, Any] = max(dlss_list, key=lambda item: _version_key(str(item.get("version", ""))))
-    out.sr_version = str(best_sr.get("version", ""))
-    log(f"nvngx_dlss newest version: {out.sr_version}")
-
-    sr_zip: Path = cache_dir / "nvngx_dlss.zip"
-    sr_url = validate_download_url(best_sr.get("url", ""), "nvngx_dlss")
-    _cached_download(sr_zip, sr_url, out.sr_version, progress, force)
-    out.sr_dll_path = zip_extract_matching(sr_zip, cache_dir, ["*nvngx_dlss.dll"], flatten=True)[0]
-    out.binaries["nvngx_dlss.dll"] = BinaryInfo(
-        name="nvngx_dlss.dll",
-        version=out.sr_version,
-        sha256=sha256_file(out.sr_dll_path),
-        size_bytes=out.sr_dll_path.stat().st_size,
-        source_url=sr_url,
-    )
-
+    out = NgxBundle()
+    cache_dir = get_cache_dir()
+    manifest_result = _resolve_rhi_manifest(log, cache_dir, progress, force)
+    manifest = RhiManifestPayload.model_validate_json(manifest_result.path.read_bytes())
+    short_fuse = tuple(entry for entry in manifest.dlssnr if "SF" in entry.version)
+    nr_entry = max(short_fuse or manifest.dlssnr, key=lambda entry: _version_key(entry.version))
+    sr_entry = max(manifest.dlss, key=lambda entry: _version_key(entry.version))
+    nr_result = _resolve_ngx("ngx_nr", nr_entry, cache_dir / "nvngx_dlssnr.zip", log, progress, force)
+    sr_result = _resolve_ngx("ngx_sr", sr_entry, cache_dir / "nvngx_dlss.zip", log, progress, force)
+    out.nr_version = nr_result.revision.removeprefix("dlssnr-")
+    out.sr_version = sr_result.revision.removeprefix("dlss-")
+    out.warnings = manifest_result.warnings + nr_result.warnings + sr_result.warnings
+    out.nr_dll_path = zip_extract_matching(nr_result.path, cache_dir, ["*nvngx_dlssnr.dll"], flatten=True)[0]
+    out.sr_dll_path = zip_extract_matching(sr_result.path, cache_dir, ["*nvngx_dlss.dll"], flatten=True)[0]
+    out.binaries["nvngx_dlssnr.dll"] = _binary(out.nr_dll_path, "nvngx_dlssnr.dll", nr_result)
+    out.binaries["nvngx_dlss.dll"] = _binary(out.sr_dll_path, "nvngx_dlss.dll", sr_result)
     return out
 
 
@@ -302,94 +323,130 @@ class ReshadeBundle:
         self.version: str = ""
         self.setup_exe_path: Path | None = None
         self.binaries: dict[str, BinaryInfo] = {}
+        self.warnings: tuple[ResolutionWarning, ...] = ()
 
 
 def fetch_reshade(log: LogFn, progress: ProgressFn | None = None, force: bool = False) -> ReshadeBundle:
-    out: ReshadeBundle = ReshadeBundle()
-    log("Checking reshade.me for the current version...")
-    cache_dir: Path = get_cache_dir()
+    out = ReshadeBundle()
+    cache_dir = get_cache_dir()
+    policy = _policy("reshade_addon")
+    page_url = policy.discovery.page_url
+    download_pattern = policy.discovery.download_pattern
+    if page_url is None or download_pattern is None:
+        raise RuntimeError("ReShade policy is incomplete")
 
-    page: str = http_get_text("https://reshade.me/")
-    matches: list[str] = re.findall(r"reshade_setup_([0-9\.]+)_addon\.exe", page, re.IGNORECASE)
-    if not matches:
-        raise RuntimeError("Could not scrape ReShade Addon version from reshade.me")
+    def latest() -> Sequence[ArtifactCandidate]:
+        page = http_get_text(page_url)
+        matches = re.findall(r"reshade_setup_([0-9.]+)_addon\.exe", page, re.IGNORECASE)
+        if not matches:
+            return ()
+        version = max(matches, key=_version_key)
+        url = download_pattern.format(version=version)
+        return (
+            ArtifactCandidate(
+                provider=policy.provider,
+                revision=version,
+                name=Path(urlparse(url).path).name,
+                url=url,
+            ),
+        )
 
-    out.version = max(matches, key=_version_key)
-    log(f"ReShade latest version: {out.version}")
-
-    url: str = f"https://reshade.me/downloads/ReShade_Setup_{out.version}_Addon.exe"
-    exe_path: Path = cache_dir / f"ReShade_Setup_{out.version}_Addon.exe"
-    if force or not exe_path.exists():
-        log(f"  Downloading ReShade Setup {out.version}...")
-    _cached_download(exe_path, url, out.version, progress, force)
-
-    out.setup_exe_path = exe_path
-    out.binaries["ReShade_Setup"] = BinaryInfo(
-        name=f"ReShade_Setup_{out.version}_Addon.exe",
-        version=out.version,
-        sha256=sha256_file(exe_path),
-        size_bytes=exe_path.stat().st_size,
-        source_url=url,
+    resolved = _resolver(log).resolve(
+        "reshade_addon",
+        policy,
+        cache_dir / "ReShade_Setup_Addon.exe",
+        latest,
+        progress=progress,
+        force=force,
     )
+    out.version = resolved.revision
+    out.setup_exe_path = resolved.path
+    out.warnings = resolved.warnings
+    out.binaries["ReShade_Setup"] = _binary(resolved.path, resolved.name, resolved)
     return out
 
 
 class LumeniteBundle:
     def __init__(self) -> None:
-        self.branch: str = "main"
+        self.branch: str = "mainline"
+        self.revision: str = ""
         self.staging_dir: Path | None = None
         self.files: list[Path] = []
         self.binaries: dict[str, BinaryInfo] = {}
+        self.warnings: tuple[ResolutionWarning, ...] = ()
 
 
 def fetch_lumenite(log: LogFn, progress: ProgressFn | None = None, force: bool = False) -> LumeniteBundle:
-    out: LumeniteBundle = LumeniteBundle()
-    log("Fetching LumeniteFX (motion-vector provider) from github.com/umar-afzaal/LumeniteFX...")
-    cache_dir: Path = get_cache_dir()
+    out = LumeniteBundle()
+    cache_dir = get_cache_dir()
+    policy = _policy("lumenite")
+    adapter = _github()
+    repository = policy.repository
+    branch = policy.discovery.branch
+    if repository is None or branch is None:
+        raise RuntimeError("LumeniteFX policy is incomplete")
 
-    github = _github()
-    snapshot = github.repository_snapshot("umar-afzaal/LumeniteFX")
-    out.branch = snapshot.branch
-    log(f"  source branch: {out.branch}")
-    archive = github.repository_archive(snapshot)
-    zip_path: Path = cache_dir / "LumeniteFX.zip"
-    _cached_download(zip_path, archive.url, archive.revision, progress, force)
+    def latest() -> Sequence[ArtifactCandidate]:
+        snapshot = adapter.repository_snapshot(repository, branch)
+        archive = adapter.repository_archive(snapshot)
+        return (_artifact_candidate(adapter.name, archive),)
 
-    safe_revision = re.sub(r"[^A-Za-z0-9_.-]", "_", archive.revision)[:24]
-    staging: Path = cache_dir / f"lumenite_stage_{safe_revision}"
+    resolved = _resolver(log).resolve(
+        "lumenite",
+        policy,
+        cache_dir / "LumeniteFX.zip",
+        latest,
+        progress=progress,
+        force=force,
+    )
+    out.branch = branch
+    out.revision = resolved.revision
+    out.warnings = resolved.warnings
+    out.binaries["LumeniteFX.zip"] = _binary(resolved.path, "LumeniteFX.zip", resolved)
+    safe_revision = re.sub(r"[^A-Za-z0-9_.-]", "_", resolved.revision)[:24]
+    staging = cache_dir / f"lumenite_stage_{safe_revision}"
     marker = staging / ".complete"
     with resource_lock(staging):
-        if force or not marker.is_file():
+        if not marker.is_file():
             temporary = Path(tempfile.mkdtemp(prefix="lumenite-stage-", dir=cache_dir))
             try:
-                with zipfile.ZipFile(zip_path, "r") as zf:
-                    for info in zf.infolist():
+                with zipfile.ZipFile(resolved.path, "r") as archive:
+                    for info in archive.infolist():
                         if info.is_dir():
                             continue
-                        name: str = info.filename.replace("\\", "/")
-                        parts: list[str] = name.split("/", 1)
+                        name = info.filename.replace("\\", "/")
+                        parts = name.split("/", 1)
                         if len(parts) < 2:
                             continue
-                        rel: str = parts[1]
-                        if rel.startswith("Shaders/"):
-                            dest_rel: str = "reshade-shaders/Shaders/" + rel[len("Shaders/") :]
-                        elif rel.startswith("Textures/"):
-                            dest_rel = "reshade-shaders/Textures/" + rel[len("Textures/") :]
+                        relative = parts[1]
+                        if relative.startswith("Shaders/"):
+                            destination = "reshade-shaders/Shaders/" + relative.removeprefix("Shaders/")
+                        elif relative.startswith("Textures/"):
+                            destination = "reshade-shaders/Textures/" + relative.removeprefix("Textures/")
                         else:
                             continue
-                        target = safe_archive_destination(temporary, dest_rel)
-                        atomic_write_bytes(target, zf.read(info))
-                atomic_write_text(temporary / ".complete", archive.revision)
-                if staging.exists():
-                    shutil.rmtree(staging)
-                temporary.replace(staging)
+                        target = safe_archive_destination(temporary, destination)
+                        atomic_write_bytes(target, archive.read(info))
+                atomic_write_text(temporary / ".complete", resolved.revision)
+                backup = Path(tempfile.mkdtemp(prefix=f".{staging.name}.backup-", dir=cache_dir))
+                backup.rmdir()
+                try:
+                    if staging.exists():
+                        staging.replace(backup)
+                    temporary.replace(staging)
+                except Exception:
+                    if not staging.exists() and backup.exists():
+                        backup.replace(staging)
+                    raise
+                finally:
+                    if backup.exists():
+                        shutil.rmtree(backup, ignore_errors=True)
             finally:
                 if temporary.exists():
                     shutil.rmtree(temporary, ignore_errors=True)
     out.staging_dir = staging
     out.files = [path for path in staging.rglob("*") if path.is_file() and path != marker]
-
-    log(f"  staged {len(out.files)} LumeniteFX files.")
+    log(f"Staged {len(out.files)} LumeniteFX files from {resolved.revision}.")
     return out
 
 
@@ -399,31 +456,47 @@ class ReshadeHeaders:
         self.ui_fxh_path: Path | None = None
         self.drawtext_path: Path | None = None
         self.binaries: dict[str, BinaryInfo] = {}
+        self.warnings: tuple[ResolutionWarning, ...] = ()
 
 
 def fetch_reshade_headers(log: LogFn, progress: ProgressFn | None = None, force: bool = False) -> ReshadeHeaders:
-    out: ReshadeHeaders = ReshadeHeaders()
-    log("Fetching standard ReShade shader headers (ReShade.fxh, ReShadeUI.fxh, DrawText.fxh)...")
-    cache_dir: Path = get_cache_dir()
+    out = ReshadeHeaders()
+    cache_dir = get_cache_dir()
+    policy = _policy("reshade_headers")
+    adapter = _github()
+    repository = policy.repository
+    branch = policy.discovery.branch
+    relative_paths = policy.discovery.relative_paths
+    if repository is None or branch is None or not relative_paths:
+        raise RuntimeError("ReShade headers policy is incomplete")
+    snapshot: RepositorySnapshot | None = None
 
-    github = _github()
-    snapshot = github.repository_snapshot("crosire/reshade-shaders")
-    for fname in ["ReShade.fxh", "ReShadeUI.fxh", "DrawText.fxh"]:
-        dest: Path = cache_dir / fname
-        asset = github.repository_file(snapshot.repository, snapshot.revision, f"Shaders/{fname}")
-        _cached_download(dest, asset.url, asset.revision, progress, force)
-        setattr(out, fname.lower().replace(".", "_") + ("_path" if not fname.lower().endswith("path") else ""), dest)
-        out.binaries[fname] = BinaryInfo(
-            name=fname,
-            version=asset.revision,
-            sha256=sha256_file(dest),
-            size_bytes=dest.stat().st_size,
-            source_url=asset.url,
+    def latest(relative_path: str) -> tuple[ArtifactCandidate, ...]:
+        nonlocal snapshot
+        if snapshot is None:
+            snapshot = adapter.repository_snapshot(repository, branch)
+        return _repository_file_candidates(adapter, repository, snapshot.revision, relative_path)
+
+    results: dict[str, ResolvedArtifact] = {}
+    warnings: list[ResolutionWarning] = []
+    for relative_path in relative_paths:
+        name = Path(relative_path).name
+        resolved = _resolver(log).resolve(
+            "reshade_headers",
+            policy,
+            cache_dir / name,
+            partial(latest, relative_path),
+            stable_name=name,
+            progress=progress,
+            force=force,
         )
-
-    out.fxh_path = cache_dir / "ReShade.fxh"
-    out.ui_fxh_path = cache_dir / "ReShadeUI.fxh"
-    out.drawtext_path = cache_dir / "DrawText.fxh"
+        results[name] = resolved
+        warnings.extend(resolved.warnings)
+        out.binaries[name] = _binary(resolved.path, name, resolved)
+    out.fxh_path = results["ReShade.fxh"].path
+    out.ui_fxh_path = results["ReShadeUI.fxh"].path
+    out.drawtext_path = results["DrawText.fxh"].path
+    out.warnings = tuple(warnings)
     return out
 
 
@@ -434,6 +507,7 @@ class DgvoodooBundle:
         self.conf: Path | None = None
         self.cpl: Path | None = None
         self.binaries: dict[str, BinaryInfo] = {}
+        self.warnings: tuple[ResolutionWarning, ...] = ()
 
 
 def fetch_dgvoodoo(
@@ -442,45 +516,44 @@ def fetch_dgvoodoo(
     force: bool = False,
     architecture: str = "x86",
 ) -> DgvoodooBundle:
-    out: DgvoodooBundle = DgvoodooBundle()
     if architecture not in {"x86", "x64"}:
         raise ValueError(f"Unsupported dgVoodoo architecture: {architecture}")
-    log("Checking github.com/dege-diosg/dgVoodoo2 for the latest release...")
-    cache_dir: Path = get_cache_dir()
+    out = DgvoodooBundle()
+    cache_dir = get_cache_dir()
+    policy = _policy("dgvoodoo2")
+    adapter = _github()
+    repository = policy.repository
+    if repository is None:
+        raise RuntimeError("dgVoodoo2 policy has no repository")
 
-    release = _github().latest_release("dege-diosg/dgVoodoo2")
-    compatible_assets = [
-        asset
-        for asset in release.assets
-        if asset.name.lower().startswith("dgvoodoo2_")
-        and asset.name.lower().endswith(".zip")
-        and "dbg" not in asset.name.lower()
-        and "dev" not in asset.name.lower()
-    ]
-    if not compatible_assets:
-        published = ", ".join(asset.name for asset in release.assets) or "none"
-        raise RuntimeError(
-            f"dgVoodoo2 release {release.tag} has no compatible ZIP asset; published assets: {published}"
+    def latest() -> Sequence[ArtifactCandidate]:
+        candidates = _release_candidates(adapter, repository)
+        return tuple(
+            candidate
+            for candidate in candidates
+            if "dbg" not in candidate.name.lower() and "dev" not in candidate.name.lower()
         )
-    asset = compatible_assets[0]
-    out.version = release.tag
-    zip_path: Path = cache_dir / asset.name
-    _cached_download(zip_path, asset.url, release.tag, progress, force)
 
+    resolved = _resolver(log).resolve(
+        "dgvoodoo2",
+        policy,
+        cache_dir / "dgVoodoo2.zip",
+        latest,
+        architecture=architecture,
+        progress=progress,
+        force=force,
+    )
+    out.version = resolved.revision
+    out.warnings = resolved.warnings
     stage = cache_dir / f"dgvoodoo_{architecture}"
-    extracted_d3d9 = zip_extract_matching(zip_path, stage, [f"MS/{architecture}/D3D9.dll"], flatten=True)[0]
-    extracted_conf = zip_extract_matching(zip_path, stage, ["dgVoodoo.conf"], flatten=True)[0]
-    extracted_cpl = zip_extract_matching(zip_path, stage, ["dgVoodooCpl.exe"], flatten=True)[0]
-
-    out.d3d9_dll = extracted_d3d9
-    out.conf = extracted_conf
-    out.cpl = extracted_cpl
-    for path in [extracted_d3d9, extracted_conf, extracted_cpl]:
-        out.binaries[path.name] = BinaryInfo(
-            name=path.name,
-            version=release.tag,
-            sha256=sha256_file(path),
-            size_bytes=path.stat().st_size,
-            source_url=asset.url,
-        )
+    out.d3d9_dll = zip_extract_matching(
+        resolved.path,
+        stage,
+        [f"MS/{architecture}/D3D9.dll"],
+        flatten=True,
+    )[0]
+    out.conf = zip_extract_matching(resolved.path, stage, ["dgVoodoo.conf"], flatten=True)[0]
+    out.cpl = zip_extract_matching(resolved.path, stage, ["dgVoodooCpl.exe"], flatten=True)[0]
+    for path in (out.d3d9_dll, out.conf, out.cpl):
+        out.binaries[path.name] = _binary(path, path.name, resolved)
     return out

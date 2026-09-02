@@ -1,3 +1,4 @@
+import json
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -6,6 +7,7 @@ from typing import Any
 import pytest
 from pytest_mock import MockerFixture
 
+from dlss5_enabler.network.resolver import ArtifactResolutionError, ResolutionWarningCode, UpstreamResolutionError
 from dlss5_enabler.network.sources import (
     fetch_dgvoodoo,
     fetch_feeder,
@@ -16,6 +18,10 @@ from dlss5_enabler.network.sources import (
     fetch_reshade_headers,
     zip_extract_matching,
 )
+
+MANIFEST_REVISION = "a" * 40
+HEADERS_REVISION = "b" * 40
+LUMENITE_REVISION = "c" * 40
 
 
 def _create_mock_zip(files: dict[str, bytes]) -> bytes:
@@ -145,11 +151,15 @@ def test_fetch_feeder_rejects_release_without_compatible_assets(tmp_path: Path, 
             ],
         },
     )
-    download = mocker.patch("dlss5_enabler.network.sources.http_download_file")
+    download = mocker.patch(
+        "dlss5_enabler.network.sources.http_download_file",
+        side_effect=RuntimeError("download rejected"),
+    )
 
-    with pytest.raises(RuntimeError, match="has no compatible asset"):
+    with pytest.raises(UpstreamResolutionError, match="no matching asset"):
         fetch_feeder(log=lambda _message: None)
-    download.assert_not_called()
+    download.assert_called_once()
+    assert download.call_args.args[0].endswith("/v0.12.0/DLSS5-Feeder-0.12.0.zip")
 
 
 def test_fetch_feeder_invalidates_cache_when_release_changes(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -262,13 +272,18 @@ def test_fetch_ngx_dlls(tmp_path: Path, mocker: MockerFixture) -> None:
         "dlssnr": [{"version": "310.8.SF-v2", "url": "https://example.com/nr.zip"}],
         "dlss": [{"version": "310.8.0", "url": "https://example.com/sr.zip"}],
     }
-    metadata = mocker.patch("dlss5_enabler.network.sources.http_get_json", return_value=mock_manifest)
+    metadata = mocker.patch(
+        "dlss5_enabler.network.sources.http_get_json",
+        return_value={"sha": MANIFEST_REVISION},
+    )
 
     def mock_download(url: str, dest: Path | str, progress_fn: Any = None) -> Path:
-        dll_name = "nvngx_dlssnr.dll" if "nr" in url else "nvngx_dlss.dll"
-        zip_bytes = _create_mock_zip({dll_name: b"NGX_DLL_BINARY"})
         p = Path(dest)
-        p.write_bytes(zip_bytes)
+        if url.endswith("dlss_manifest.json"):
+            p.write_text(json.dumps(mock_manifest), encoding="utf-8")
+        else:
+            dll_name = "nvngx_dlssnr.dll" if "nr" in url else "nvngx_dlss.dll"
+            p.write_bytes(_create_mock_zip({dll_name: b"NGX_DLL_BINARY"}))
         return p
 
     download = mocker.patch("dlss5_enabler.network.sources.http_download_file", side_effect=mock_download)
@@ -279,30 +294,37 @@ def test_fetch_ngx_dlls(tmp_path: Path, mocker: MockerFixture) -> None:
     assert bundle.nr_dll_path is not None and bundle.nr_dll_path.is_file()
     assert bundle.sr_dll_path is not None and bundle.sr_dll_path.is_file()
     assert [item.args[0] for item in download.call_args_list] == [
+        f"https://raw.githubusercontent.com/RankFTW/RHI/{MANIFEST_REVISION}/dlss_manifest.json",
         "https://example.com/nr.zip",
         "https://example.com/sr.zip",
     ]
-    metadata.assert_called_once_with("https://raw.githubusercontent.com/RankFTW/RHI/main/dlss_manifest.json")
+    metadata.assert_called_once_with("https://api.github.com/repos/RankFTW/RHI/commits/main")
 
 
 def test_fetch_ngx_requires_canonical_dll_names(tmp_path: Path, mocker: MockerFixture) -> None:
     mocker.patch("dlss5_enabler.network.sources.get_cache_dir", return_value=tmp_path)
+    mock_manifest = {
+        "dlssnr": [{"version": "1.0.SF", "url": "https://example.com/nr.zip"}],
+        "dlss": [{"version": "1.0", "url": "https://example.com/sr.zip"}],
+    }
     mocker.patch(
         "dlss5_enabler.network.sources.http_get_json",
-        return_value={
-            "dlssnr": [{"version": "1.0.SF", "url": "https://example.com/nr.zip"}],
-            "dlss": [{"version": "1.0", "url": "https://example.com/sr.zip"}],
-        },
+        return_value={"sha": MANIFEST_REVISION},
     )
 
-    def mock_download(_url: str, dest: Path | str, progress_fn: Any = None) -> Path:
+    def mock_download(url: str, dest: Path | str, progress_fn: Any = None) -> Path:
         path = Path(dest)
-        path.write_bytes(_create_mock_zip({"unrelated.dll": b"WRONG"}))
+        if url.endswith("dlss_manifest.json"):
+            path.write_text(json.dumps(mock_manifest), encoding="utf-8")
+        else:
+            path.write_bytes(_create_mock_zip({"unrelated.dll": b"WRONG"}))
         return path
 
     mocker.patch("dlss5_enabler.network.sources.http_download_file", side_effect=mock_download)
-    with pytest.raises(ValueError, match="No matching files"):
+    with pytest.raises(UpstreamResolutionError) as captured:
         fetch_ngx_dlls(log=lambda _message: None, force=True)
+    assert isinstance(captured.value.latest, ArtifactResolutionError)
+    assert captured.value.latest.code is ResolutionWarningCode.CONTENT_MISSING
 
 
 def test_fetch_reshade(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -328,7 +350,7 @@ def test_fetch_reshade_headers(tmp_path: Path, mocker: MockerFixture) -> None:
     mocker.patch("dlss5_enabler.network.sources.get_cache_dir", return_value=tmp_path)
     metadata = mocker.patch(
         "dlss5_enabler.network.sources.http_get_json",
-        side_effect=[{"default_branch": "slim"}, {"sha": "headers-revision"}],
+        return_value={"sha": HEADERS_REVISION},
     )
 
     def mock_download(url: str, dest: Path | str, progress_fn: Any = None) -> Path:
@@ -343,12 +365,11 @@ def test_fetch_reshade_headers(tmp_path: Path, mocker: MockerFixture) -> None:
     assert bundle.ui_fxh_path is not None and bundle.ui_fxh_path.is_file()
     assert bundle.drawtext_path is not None and bundle.drawtext_path.is_file()
     assert [item.args[0] for item in download.call_args_list] == [
-        "https://raw.githubusercontent.com/crosire/reshade-shaders/headers-revision/Shaders/ReShade.fxh",
-        "https://raw.githubusercontent.com/crosire/reshade-shaders/headers-revision/Shaders/ReShadeUI.fxh",
-        "https://raw.githubusercontent.com/crosire/reshade-shaders/headers-revision/Shaders/DrawText.fxh",
+        f"https://raw.githubusercontent.com/crosire/reshade-shaders/{HEADERS_REVISION}/Shaders/ReShade.fxh",
+        f"https://raw.githubusercontent.com/crosire/reshade-shaders/{HEADERS_REVISION}/Shaders/ReShadeUI.fxh",
+        f"https://raw.githubusercontent.com/crosire/reshade-shaders/{HEADERS_REVISION}/Shaders/DrawText.fxh",
     ]
     assert [item.args[0] for item in metadata.call_args_list] == [
-        "https://api.github.com/repos/crosire/reshade-shaders",
         "https://api.github.com/repos/crosire/reshade-shaders/commits/slim",
     ]
 
@@ -357,14 +378,15 @@ def test_fetch_lumenite(tmp_path: Path, mocker: MockerFixture) -> None:
     mocker.patch("dlss5_enabler.network.sources.get_cache_dir", return_value=tmp_path)
     metadata = mocker.patch(
         "dlss5_enabler.network.sources.http_get_json",
-        side_effect=[{"default_branch": "main"}, {"sha": "lumenite-revision"}],
+        return_value={"sha": LUMENITE_REVISION},
     )
 
     def mock_download(url: str, dest: Path | str, progress_fn: Any = None) -> Path:
         zip_bytes = _create_mock_zip(
             {
-                "LumeniteFX-main/Shaders/Lumen.fx": b"LUMEN_FX",
-                "LumeniteFX-main/Textures/LumenTex.png": b"PNG_DATA",
+                "LumeniteFX-main/Shaders/lumenite_Kernel.fx": b"LUMEN_FX",
+                "LumeniteFX-main/Shaders/include/lumenite_common.fxh": b"INCLUDE",
+                "LumeniteFX-main/Textures/lumenite_bluenoise256.png": b"PNG_DATA",
                 "LumeniteFX-main/README.md": b"IGNORED_MD",
             }
         )
@@ -375,15 +397,15 @@ def test_fetch_lumenite(tmp_path: Path, mocker: MockerFixture) -> None:
     download = mocker.patch("dlss5_enabler.network.sources.http_download_file", side_effect=mock_download)
 
     bundle = fetch_lumenite(log=lambda msg: None, force=True)
-    assert len(bundle.files) == 2
+    assert len(bundle.files) == 3
     filenames = [f.name for f in bundle.files]
-    assert "Lumen.fx" in filenames
-    assert "LumenTex.png" in filenames
+    assert "lumenite_Kernel.fx" in filenames
+    assert "lumenite_common.fxh" in filenames
+    assert "lumenite_bluenoise256.png" in filenames
     assert download.call_count == 1
-    assert download.call_args.args[0] == "https://codeload.github.com/umar-afzaal/LumeniteFX/zip/lumenite-revision"
+    assert download.call_args.args[0] == f"https://codeload.github.com/umar-afzaal/LumeniteFX/zip/{LUMENITE_REVISION}"
     assert [item.args[0] for item in metadata.call_args_list] == [
-        "https://api.github.com/repos/umar-afzaal/LumeniteFX",
-        "https://api.github.com/repos/umar-afzaal/LumeniteFX/commits/main",
+        "https://api.github.com/repos/umar-afzaal/LumeniteFX/commits/mainline",
     ]
 
 
@@ -391,7 +413,7 @@ def test_fetch_lumenite_rejects_traversal(tmp_path: Path, mocker: MockerFixture)
     mocker.patch("dlss5_enabler.network.sources.get_cache_dir", return_value=tmp_path)
     mocker.patch(
         "dlss5_enabler.network.sources.http_get_json",
-        side_effect=[{"default_branch": "main"}, {"sha": "lumenite-revision"}],
+        return_value={"sha": LUMENITE_REVISION},
     )
 
     def mock_download(_url: str, dest: Path | str, progress_fn: Any = None) -> Path:
@@ -400,8 +422,10 @@ def test_fetch_lumenite_rejects_traversal(tmp_path: Path, mocker: MockerFixture)
         return path
 
     mocker.patch("dlss5_enabler.network.sources.http_download_file", side_effect=mock_download)
-    with pytest.raises(ValueError, match="Unsafe archive member"):
+    with pytest.raises(UpstreamResolutionError) as captured:
         fetch_lumenite(log=lambda _message: None, force=True)
+    assert isinstance(captured.value.latest, ArtifactResolutionError)
+    assert captured.value.latest.code is ResolutionWarningCode.ARCHIVE_UNSAFE
     assert not (tmp_path / "outside.fx").exists()
 
 

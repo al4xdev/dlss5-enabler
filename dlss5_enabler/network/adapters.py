@@ -18,7 +18,7 @@ def _validate_repository(repository: str) -> str:
 def validate_download_url(value: object, component: str) -> str:
     url = str(value)
     parsed = urlparse(url)
-    if parsed.scheme != "https" or not parsed.netloc:
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None or parsed.password is not None:
         raise RuntimeError(f"{component} has no valid HTTPS download URL")
     return url
 
@@ -28,6 +28,9 @@ class SourceAsset:
     name: str
     url: str
     revision: str
+    asset_id: int | None = None
+    size_bytes: int | None = None
+    sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,14 +138,14 @@ class GitHubDownloadSourceAdapter(DownloadSourceAdapter):
             raise TypeError(f"GitHub commit response for {repository}@{selected_branch} is not an object")
         commit = cast(dict[str, Any], raw_commit)
         revision = str(commit.get("sha", ""))
-        if not revision:
-            raise RuntimeError(f"GitHub repository {repository}@{selected_branch} has no commit revision")
+        if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+            raise RuntimeError(f"GitHub repository {repository}@{selected_branch} has no immutable commit revision")
         return RepositorySnapshot(repository=repository, branch=selected_branch, revision=revision)
 
     def repository_file(self, repository: str, reference: str, relative_path: str) -> SourceAsset:
         repository = _validate_repository(repository)
-        if not reference:
-            raise ValueError("GitHub file reference cannot be empty")
+        if re.fullmatch(r"[0-9a-f]{40}", reference) is None:
+            raise ValueError("GitHub file reference must be an immutable 40-character commit")
         path_parts = relative_path.replace("\\", "/").split("/")
         if not relative_path or relative_path.startswith("/") or any(part in {"", ".", ".."} for part in path_parts):
             raise ValueError(f"Invalid repository file path: {relative_path}")
@@ -153,8 +156,8 @@ class GitHubDownloadSourceAdapter(DownloadSourceAdapter):
 
     def repository_archive(self, snapshot: RepositorySnapshot) -> SourceAsset:
         repository = _validate_repository(snapshot.repository)
-        if not snapshot.revision:
-            raise ValueError("Repository archive revision cannot be empty")
+        if re.fullmatch(r"[0-9a-f]{40}", snapshot.revision) is None:
+            raise ValueError("Repository archive revision must be an immutable 40-character commit")
         revision = quote(snapshot.revision, safe="")
         return SourceAsset(
             name=f"{repository.rsplit('/', 1)[1]}-{snapshot.revision[:12]}.zip",
@@ -180,8 +183,36 @@ class GitHubDownloadSourceAdapter(DownloadSourceAdapter):
             if not asset_name:
                 raise RuntimeError(f"GitHub release {tag} contains an asset without a name")
             asset_url = validate_download_url(asset.get("browser_download_url", ""), f"GitHub asset {asset_name}")
-            assets.append(SourceAsset(name=asset_name, url=asset_url, revision=tag))
+            asset_id = GitHubDownloadSourceAdapter._optional_positive_int(asset.get("id"), "id", asset_name)
+            size_bytes = GitHubDownloadSourceAdapter._optional_positive_int(asset.get("size"), "size", asset_name)
+            digest = GitHubDownloadSourceAdapter._optional_digest(asset.get("digest"), asset_name)
+            assets.append(
+                SourceAsset(
+                    name=asset_name,
+                    url=asset_url,
+                    revision=tag,
+                    asset_id=asset_id,
+                    size_bytes=size_bytes,
+                    sha256=digest,
+                )
+            )
         return SourceRelease(tag=tag, assets=tuple(assets))
+
+    @staticmethod
+    def _optional_positive_int(value: object, field: str, asset_name: str) -> int | None:
+        if value is None:
+            return None
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise TypeError(f"GitHub asset {asset_name} has invalid {field}")
+        return value
+
+    @staticmethod
+    def _optional_digest(value: object, asset_name: str) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+            raise TypeError(f"GitHub asset {asset_name} has invalid digest")
+        return value.removeprefix("sha256:")
 
 
 def get_download_source_adapter(name: str, json_fetcher: JsonFetcher) -> DownloadSourceAdapter:

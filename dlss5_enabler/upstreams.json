@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "components": {
+    "feeder": {
+      "provider": "github",
+      "repository": "jlrouzies-fr/DLSS5-Feeder",
+      "artifact_kind": "zip",
+      "discovery": {
+        "kind": "latest_release",
+        "asset_patterns": ["DLSS5-Feeder-*.zip", "DLSS5-Feeder.zip"]
+      },
+      "stable_artifacts": [
+        {
+          "revision": "v0.12.0",
+          "name": "DLSS5-Feeder-0.12.0.zip",
+          "url": "https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/download/v0.12.0/DLSS5-Feeder-0.12.0.zip",
+          "sha256": "e970537996f6e73dce9a510b9e015fad19f148ee736dc4f518ccdebf6f012558"
+        }
+      ],
+      "min_supported_format": 1,
+      "max_supported_format": 2,
+      "formats": [
+        {
+          "version": 1,
+          "required_members": [
+            "dlss5-feed.addon64",
+            "dlss5-feed.addon32",
+            "DLSS5_Feed.fx",
+            "dlss5-feed-host64.exe"
+          ]
+        },
+        {
+          "version": 2,
+          "required_members": [
+            "*dlss5-feed.addon64",
+            "*dlss5-feed.addon32",
+            "*DLSS5_Feed.fx",
+            "*dlss5-feed-host64.exe"
+          ],
+          "architecture_members": {
+            "x86": ["layer-x86/*"],
+            "x64": ["layer-x64/*"]
+          }
+        }
+      ]
+    },
+    "renodx_dlss5": {
+      "provider": "github",
+      "repository": "RankFTW/rhi-repo",
+      "artifact_kind": "zip",
+      "discovery": {
+        "kind": "release_list",
+        "asset_patterns": ["*.zip"],
+        "release_tag_prefix": "renodx-dlss5-"
+      },
+      "stable_artifacts": [
+        {
+          "revision": "renodx-dlss5-4.70",
+          "name": "renodx-dlss5_4.70.zip",
+          "url": "https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-4.70/renodx-dlss5_4.70.zip",
+          "sha256": "d6e356d01b429af6288f488a4926c44f1d779a7d4586ee8c79d04d3a09a536e6"
+        }
+      ],
+      "formats": [
+        {
+          "version": 1,
+          "required_members": ["*renodx-dlss5.addon64"]
+        }
+      ]
+    },
+    "rhi_manifest": {
+      "provider": "github",
+      "repository": "RankFTW/RHI",
+      "artifact_kind": "json",
+      "discovery": {
+        "kind": "repository_file",
+        "branch": "main",
+        "relative_path": "dlss_manifest.json"
+      },
+      "stable_artifacts": [
+        {
+          "revision": "c2ea61e162020b265d4dfc9481836a46b93fba13",
+          "name": "dlss_manifest.json",
+          "url": "https://raw.githubusercontent.com/RankFTW/RHI/c2ea61e162020b265d4dfc9481836a46b93fba13/dlss_manifest.json",
+          "sha256": "3fd2bc0dd999428d6fed95f2ffebf698144f7d6c98121c173f1a6f00a029dab3",
+          "size_bytes": 7534
+        }
+      ]
+    },
+    "ngx_nr": {
+      "provider": "github",
+      "repository": "RankFTW/rhi-repo",
+      "artifact_kind": "zip",
+      "discovery": {
+        "kind": "release_list",
+        "asset_patterns": ["nvngx_dlssnr_*.zip"],
+        "release_tag_prefix": "dlssnr-"
+      },
+      "stable_artifacts": [
+        {
+          "revision": "dlssnr-310.8.SF-v2",
+          "name": "nvngx_dlssnr_310.8.SF-v2.zip",
+          "url": "https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.SF-v2/nvngx_dlssnr_310.8.SF-v2.zip",
+          "sha256": "1da35941894994eb087e017577829e492454e9bae3a6a9397027069ceb74955c"
+        }
+      ],
+      "formats": [
+        {
+          "version": 1,
+          "required_members": ["*nvngx_dlssnr.dll"]
+        }
+      ]
+    },
+    "ngx_sr": {
+      "provider": "github",
+      "repository": "RankFTW/rhi-repo",
+      "artifact_kind": "zip",
+      "discovery": {
+        "kind": "release_list",
+        "asset_patterns": ["nvngx_dlss_*.zip"],
+        "release_tag_prefix": "dlss-"
+      },
+      "stable_artifacts": [
+        {
+          "revision": "dlss-310.8.0",
+          "name": "nvngx_dlss_310.8.0.zip",
+          "url": "https://github.com/RankFTW/rhi-repo/releases/download/dlss-310.8.0/nvngx_dlss_310.8.0.zip",
+          "sha256": "fb481660f7e952b87f91760e3afd7f9dc14cd2c3361b470e948d6346e4323009"
+        }
+      ],
+      "formats": [
+        {
+          "version": 1,
+          "required_members": ["*nvngx_dlss.dll"]
+        }
+      ]
+    },
+    "reshade_headers": {
+      "provider": "github",
+      "repository": "crosire/reshade-shaders",
+      "artifact_kind": "file",
+      "discovery": {
+        "kind": "repository_file",
+        "branch": "slim",
+        "relative_paths": ["Shaders/ReShade.fxh", "Shaders/ReShadeUI.fxh", "Shaders/DrawText.fxh"]
+      },
+      "stable_artifacts": [
+        {
+          "revision": "6db142b4b1a05c764222e5b0bd9a644b7ccfe1dc",
+          "name": "ReShade.fxh",
+          "url": "https://raw.githubusercontent.com/crosire/reshade-shaders/6db142b4b1a05c764222e5b0bd9a644b7ccfe1dc/Shaders/ReShade.fxh",
+          "sha256": "2fffb6009b9593bc43473861e5b189a6faee1bd7465913fa8799b85d77df066f"
+        },
+        {
+          "revision": "6db142b4b1a05c764222e5b0bd9a644b7ccfe1dc",
+          "name": "ReShadeUI.fxh",
+          "url": "https://raw.githubusercontent.com/crosire/reshade-shaders/6db142b4b1a05c764222e5b0bd9a644b7ccfe1dc/Shaders/ReShadeUI.fxh",
+          "sha256": "41ff1e90338eca24ea08ea89e0f32974ab2af594b51b24c9620a0477526ab818"
+        },
+        {
+          "revision": "6db142b4b1a05c764222e5b0bd9a644b7ccfe1dc",
+          "name": "DrawText.fxh",
+          "url": "https://raw.githubusercontent.com/crosire/reshade-shaders/6db142b4b1a05c764222e5b0bd9a644b7ccfe1dc/Shaders/DrawText.fxh",
+          "sha256": "b79cc4dfb3e98bcf4c06193d00ea7631d74f467f73a4deeeee13e71336d3e680"
+        }
+      ]
+    },
+    "lumenite": {
+      "provider": "github",
+      "repository": "umar-afzaal/LumeniteFX",
+      "artifact_kind": "zip",
+      "discovery": {
+        "kind": "repository_archive",
+        "branch": "mainline"
+      },
+      "stable_artifacts": [
+        {
+          "revision": "76fa3e4d601c97e9bc63f119c01405b7b9938885",
+          "name": "LumeniteFX-76fa3e4d601c.zip",
+          "url": "https://codeload.github.com/umar-afzaal/LumeniteFX/zip/76fa3e4d601c97e9bc63f119c01405b7b9938885",
+          "sha256": "bf574543a6af6527587af0bad139922e8c0363bb154cdfb3e41133c7dca2ee3f",
+          "size_bytes": 316991
+        }
+      ],
+      "formats": [
+        {
+          "version": 1,
+          "required_members": [
+            "*/Shaders/lumenite_Kernel.fx",
+            "*/Shaders/include/*.fxh",
+            "*/Textures/lumenite_bluenoise256.png"
+          ]
+        }
+      ]
+    },
+    "dgvoodoo2": {
+      "provider": "github",
+      "repository": "dege-diosg/dgVoodoo2",
+      "artifact_kind": "zip",
+      "discovery": {
+        "kind": "latest_release",
+        "asset_patterns": ["dgVoodoo2_*.zip"]
+      },
+      "stable_artifacts": [
+        {
+          "revision": "v2.87.3",
+          "name": "dgVoodoo2_87_3.zip",
+          "url": "https://github.com/dege-diosg/dgVoodoo2/releases/download/v2.87.3/dgVoodoo2_87_3.zip",
+          "sha256": "6fb954bed55bf70e948c5045a663a9df31ea206faf105e327bafe46c318f867f"
+        }
+      ],
+      "formats": [
+        {
+          "version": 1,
+          "required_members": ["dgVoodoo.conf", "dgVoodooCpl.exe"],
+          "architecture_members": {
+            "x86": ["MS/x86/D3D9.dll"],
+            "x64": ["MS/x64/D3D9.dll"]
+          }
+        }
+      ]
+    },
+    "reshade_addon": {
+      "provider": "official",
+      "artifact_kind": "file",
+      "discovery": {
+        "kind": "official_page",
+        "page_url": "https://reshade.me/",
+        "download_pattern": "https://reshade.me/downloads/ReShade_Setup_{version}_Addon.exe"
+      },
+      "stable_artifacts": [
+        {
+          "revision": "6.8.0",
+          "name": "ReShade_Setup_6.8.0_Addon.exe",
+          "url": "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe",
+          "sha256": "afe4c8f13048306307983b8b3d41d5bf00a86820440b0e57dea10950e1176445"
+        }
+      ]
+    }
+  }
+}

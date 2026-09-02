@@ -15,7 +15,13 @@ def test_github_adapter_discovers_latest_release_asset() -> None:
             "tag_name": "v1.2.3",
             "assets": [
                 {"name": "checksums.txt", "browser_download_url": "https://example.com/checksums.txt"},
-                {"name": "package.zip", "browser_download_url": "https://example.com/package.zip"},
+                {
+                    "id": 123,
+                    "name": "package.zip",
+                    "browser_download_url": "https://example.com/package.zip",
+                    "size": 456,
+                    "digest": "sha256:" + "a" * 64,
+                },
             ],
         }
 
@@ -26,6 +32,9 @@ def test_github_adapter_discovers_latest_release_asset() -> None:
     assert asset.name == "package.zip"
     assert asset.url == "https://example.com/package.zip"
     assert asset.revision == "v1.2.3"
+    assert asset.asset_id == 123
+    assert asset.size_bytes == 456
+    assert asset.sha256 == "a" * 64
 
 
 def test_github_adapter_reports_published_assets_when_match_is_missing() -> None:
@@ -54,6 +63,27 @@ def test_github_adapter_rejects_invalid_asset_url() -> None:
         GitHubDownloadSourceAdapter(fetch_json).latest_release("owner/project")
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("id", 0, "invalid id"),
+        ("size", "large", "invalid size"),
+        ("digest", "md5:bad", "invalid digest"),
+    ],
+)
+def test_github_adapter_rejects_invalid_asset_provenance(field: str, value: object, message: str) -> None:
+    def fetch_json(_url: str) -> Any:
+        asset: dict[str, object] = {
+            "name": "package.zip",
+            "browser_download_url": "https://example.com/package.zip",
+        }
+        asset[field] = value
+        return {"tag_name": "v1.0.0", "assets": [asset]}
+
+    with pytest.raises(TypeError, match=message):
+        GitHubDownloadSourceAdapter(fetch_json).latest_release("owner/project")
+
+
 def test_github_adapter_lists_releases() -> None:
     requested: list[str] = []
 
@@ -73,7 +103,8 @@ def test_github_adapter_lists_releases() -> None:
 
 
 def test_github_adapter_builds_immutable_repository_sources() -> None:
-    responses: list[Any] = [{"default_branch": "mainline"}, {"sha": "abc123def456"}]
+    revision = "abc123def456abc123def456abc123def456abcd"
+    responses: list[Any] = [{"default_branch": "mainline"}, {"sha": revision}]
 
     def fetch_json(_url: str) -> Any:
         return responses.pop(0)
@@ -84,9 +115,18 @@ def test_github_adapter_builds_immutable_repository_sources() -> None:
     source_file = adapter.repository_file(snapshot.repository, snapshot.revision, "Shaders/ReShade.fxh")
 
     assert snapshot.branch == "mainline"
-    assert snapshot.revision == "abc123def456"
-    assert archive.url == "https://codeload.github.com/owner/project/zip/abc123def456"
-    assert source_file.url == "https://raw.githubusercontent.com/owner/project/abc123def456/Shaders/ReShade.fxh"
+    assert snapshot.revision == revision
+    assert archive.url == f"https://codeload.github.com/owner/project/zip/{revision}"
+    assert source_file.url == f"https://raw.githubusercontent.com/owner/project/{revision}/Shaders/ReShade.fxh"
+
+
+def test_github_adapter_rejects_mutable_repository_reference() -> None:
+    adapter = GitHubDownloadSourceAdapter(lambda _url: {"sha": "main"})
+
+    with pytest.raises(RuntimeError, match="immutable commit revision"):
+        adapter.repository_snapshot("owner/project", "main")
+    with pytest.raises(ValueError, match="immutable 40-character commit"):
+        adapter.repository_file("owner/project", "main", "file.txt")
 
 
 def test_download_source_adapter_factory_is_extensible() -> None:
@@ -97,7 +137,10 @@ def test_download_source_adapter_factory_is_extensible() -> None:
         get_download_source_adapter("mirror", lambda _url: {})
 
 
-@pytest.mark.parametrize("url", ["", "http://example.com/file.zip", "not-a-url"])
+@pytest.mark.parametrize(
+    "url",
+    ["", "http://example.com/file.zip", "not-a-url", "https://token@example.com/file.zip"],
+)
 def test_validate_download_url_rejects_non_https(url: str) -> None:
     with pytest.raises(RuntimeError, match="valid HTTPS"):
         validate_download_url(url, "component")
