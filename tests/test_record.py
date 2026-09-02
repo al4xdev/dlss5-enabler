@@ -83,7 +83,7 @@ def test_record_save_load_exists(tmp_path: Path) -> None:
     assert loaded.game_exe == game_exe.as_posix()
     assert loaded.architecture == "x64"
     assert len(loaded.files) == 1
-    assert loaded.files[0].path == str(game_dir / "dxgi.dll")
+    assert loaded.files[0].path == (game_dir / "dxgi.dll").as_posix()
     assert "dxgi" in loaded.binaries
 
 
