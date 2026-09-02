@@ -1,13 +1,13 @@
 # DLSS5 Enabler
 
-Transactional command-line installer for the DLSS5-Feeder rendering stack on Windows, Linux, Wine, Proton, and SteamOS.
+Transactional command-line installer for managing the DLSS5-Feeder Neural Rendering stack in Windows games, either natively or through Wine and Proton.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![CI](https://github.com/al4xdev/dlss5-enabler/actions/workflows/ci.yml/badge.svg)](https://github.com/al4xdev/dlss5-enabler/actions/workflows/ci.yml)
 [![Typing](https://img.shields.io/badge/typing-mypy%20%2B%20pyright%20strict-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
-DLSS5 Enabler automates the setup that would otherwise require manually downloading several projects, placing the correct 32-bit or 64-bit binaries, configuring ReShade, editing Wine overrides, and keeping enough state to undo everything later.
+DLSS5 Enabler automates a setup that would otherwise require manually coordinating several upstream projects, selecting the correct 32-bit or 64-bit binaries, configuring ReShade, editing Wine overrides, and preserving enough state to undo every change later. The CLI runs on Windows, Linux, and SteamOS, while the installation target is always a Windows PE executable.
 
 It combines:
 
@@ -26,6 +26,20 @@ It combines:
 The rendering stack spans multiple binaries, configuration files, graphics APIs, architectures, and operating systems. A failed manual installation can overwrite an existing hook DLL, leave a partial ReShade setup, or persist a Wine registry override after the files it points to are gone.
 
 DLSS5 Enabler treats installation as a transaction. It validates the target first, records every managed mutation, and rolls changes back in reverse order if a later stage fails.
+
+## Engineering scope
+
+Although the user-facing job is game mod orchestration, the project exercises broader software-engineering concerns:
+
+- PE32 and PE32+ binary inspection, architecture selection, and graphics API heuristics;
+- provider-neutral upstream discovery with bounded HTTP retries and immutable fallbacks;
+- streaming downloads, content hashing, cache identity, and software supply-chain validation;
+- safe ZIP and 7z extraction across Windows and POSIX path conventions;
+- transactional filesystem and Wine registry changes with rollback and byte-for-byte restoration;
+- typed metadata migrations that preserve installation choices across CLI upgrades;
+- cross-platform packaging and automated validation on Windows, Linux, and macOS.
+
+macOS is a CI portability target for the Python, archive, cache, and packaging layers. It is not presented as a DLSS runtime or game-installation target.
 
 ## Reliability by design
 
@@ -46,9 +60,9 @@ The project is built to fail safely when downloads, permissions, extraction, or 
 
 These protections reduce the chance of a broken game directory, but they cannot guarantee compatibility with every game, mod loader, anti-cheat system, or upstream release.
 
-## Supported targets
+## Installation paths
 
-| Target | Mode | Main hook |
+| Rendering path | Mode | Installed integration |
 | --- | --- | --- |
 | DirectX 11 / 12 | Default | ReShade `dxgi.dll` |
 | DirectX 9 | `--d3d9` | dgVoodoo2 translation plus the 64-bit feeder host when required |
@@ -56,7 +70,17 @@ These protections reduce the chance of a broken game directory, but they cannot 
 | Vulkan | `--vulkan-layer` | Feeder Vulkan-layer fallback when available upstream |
 | 32-bit games | Automatic detection | 32-bit feeder addon with a 64-bit host bridge |
 
-The target must be a Windows PE executable, either running directly on Windows or through Wine/Proton. Native Linux ELF binaries are inspected for diagnostics but are not installation targets.
+These are implemented installer paths, not claims of universal compatibility with every engine or game. Automated tests validate API detection, architecture selection, file placement, configuration, rollback, and cleanup with synthetic binaries. Actual rendering compatibility still depends on the game, driver, mod stack, and upstream components.
+
+## Platform and target model
+
+| Environment | Role |
+| --- | --- |
+| Windows | Runs the CLI and manages a native Windows game executable |
+| Linux / SteamOS | Runs the CLI and manages a Windows game executable through Wine or Proton |
+| macOS | Runs portability, packaging, and synthetic-artifact checks in CI only |
+
+The installation target must be a Windows PE executable. Native Linux ELF binaries are inspected for diagnostics but are rejected as installation targets, and the project does not claim a native macOS DLSS runtime.
 
 ## Requirements
 
@@ -233,6 +257,88 @@ dlss5_enabler/
 ├── platform/      Windows, Linux, Wine, Proton, and Steam discovery adapters
 ├── check.py       Unified quality runner
 └── cli.py         Typer command-line interface
+```
+
+```mermaid
+flowchart TB
+    user([User]) --> cli["Typer CLI<br/>info · install · update · uninstall<br/>list · cache · version · check"]
+
+    subgraph target["Target and host inspection"]
+        pe["PE and API analysis<br/>PE32 / PE32+ · DXGI · D3D9 · OpenGL · Vulkan"]
+        platform_contract["PlatformAdapter contract"]
+        platform_impl["WindowsAdapter / LinuxAdapter"]
+        proton["ProtonManager / WineRegParser<br/>Steam prefix discovery and DLL overrides"]
+        platform_contract --> platform_impl
+    end
+
+    cli --> pe
+    cli --> platform_contract
+
+    subgraph operations["Transactional operations"]
+        install["install"] --> pipeline["12-stage installation pipeline<br/>validate · preflight · apply · record · commit"]
+        update["update"] -->|"reuse saved options"| pipeline
+        uninstall["uninstall"] --> recovery["Snapshot and recorded-mutation reversion"]
+        pipeline -->|"any stage fails"| rollback["Reverse-order rollback"]
+        rollback --> recovery
+    end
+
+    cli --> install
+    cli --> update
+    cli --> uninstall
+    pe --> pipeline
+    platform_impl --> pipeline
+    proton --> pipeline
+
+    subgraph supply["Upstream resolution and supply-chain validation"]
+        fetch["Component source functions"] --> provider["DownloadSourceAdapter<br/>provider-neutral contract"]
+        provider --> github["GitHubDownloadSourceAdapter<br/>releases · files · snapshots · archives"]
+        github --> upstreams["GitHub repositories"]
+        fetch --> direct["Direct discovery<br/>ReShade site and RHI-provided NVIDIA URLs"]
+        github --> resolver["UpstreamResolver"]
+        direct --> resolver
+        manifest["Embedded upstreams.json<br/>pinned revisions · SHA-256 · required members<br/>architecture and format bounds"] --> resolver
+        resolver --> http["Bounded HTTP<br/>deadlines · classified retries · curl fallback"]
+        http --> hosts["Original upstream hosts"]
+        resolver <--> cache["Locked, atomic cache<br/>URL + revision + SHA-256 identity"]
+        resolver --> validation["HTTPS, digest, size, archive safety,<br/>CRC, content, format, and architecture validation"]
+        validation --> bundles["Validated component bundles<br/>Feeder + Vulkan · RenoDX · NGX NR/SR<br/>ReShade + headers · LumeniteFX · dgVoodoo2"]
+    end
+
+    pipeline -->|"preflight before mutation"| fetch
+    bundles --> pipeline
+
+    subgraph mutation["Managed state and reversible mutations"]
+        fileio["Locked atomic file I/O<br/>safe archive extraction and unique backups"]
+        ini["Exact-case INI mutations"]
+        registry["Wine / Proton registry mutations"]
+        game["Windows PE game directory<br/>hook DLLs · addons · shaders · NGX · optional layers"]
+        record["Per-game dlss5-enabler.install.json<br/>tool version · options · files · original values"]
+        index["Global managed-game index"]
+        fileio --> game
+        ini --> game
+        registry --> proton_prefix["Wine / Proton prefix"]
+        record --> index
+    end
+
+    pipeline --> fileio
+    pipeline --> ini
+    pipeline --> registry
+    pipeline --> record
+    update -->|"read metadata"| record
+    uninstall -->|"read metadata"| record
+    recovery -->|"restore bytes and settings"| game
+    recovery -->|"restore overrides"| proton_prefix
+    recovery -->|"preserve or remove consistently"| record
+
+    subgraph verification["Verification and delivery"]
+        ci["GitHub Actions<br/>Ubuntu · Windows · macOS<br/>Python 3.10–3.13"] --> check["Unified check<br/>Ruff · Mypy strict · Pyright strict · Pytest"]
+        ci --> package["Build and isolated-install verification<br/>wheel resources · uv · pip"]
+        fixtures["Offline synthetic PE32 / PE32+<br/>archives and fake component binaries"] --> check
+    end
+
+    check -.-> cli
+    check -.-> pipeline
+    package -.-> manifest
 ```
 
 The Python import namespace uses an underscore (`dlss5_enabler`); the package and executable use a hyphen (`dlss5-enabler`).
