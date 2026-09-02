@@ -311,7 +311,7 @@ def test_place_file_with_backup(tmp_path: Path) -> None:
     assert backup_file.read_bytes() == b"ORIGINAL_VERSION"
 
     assert len(ctx.record.files) == 1
-    assert ctx.record.files[0].backup == str(backup_file)
+    assert ctx.record.files[0].backup == backup_file.as_posix()
 
 
 def test_place_file_never_overwrites_unreconciled_backup(tmp_path: Path) -> None:
@@ -624,7 +624,7 @@ def test_reshade_existing_ini_is_restored_on_uninstall(tmp_path: Path, mocker: M
     )
 
     assert StepInstallReShade().execute(ctx)
-    assert any(item.path == str(game_ini) and item.backup for item in ctx.record.files)
+    assert any(item.path == game_ini.as_posix() and item.backup for item in ctx.record.files)
     ctx.record.record_path().write_text(ctx.record.model_dump_json(), encoding="utf-8")
     mocker.patch("dlss5_enabler.operations.uninstall.index_remove", return_value=True)
     assert run_uninstall(tmp_path)
