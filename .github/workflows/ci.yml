@@ -51,3 +51,10 @@ jobs:
 
       - name: Test build distribution packages
         run: uv build
+
+      - name: Verify embedded wheel resources
+        run: uv run python -m dlss5_enabler.verify_wheel dist
+
+      - name: Verify isolated uv and pip installations
+        if: ${{ matrix.python-version == '3.12' }}
+        run: uv run python -m dlss5_enabler.verify_install dist

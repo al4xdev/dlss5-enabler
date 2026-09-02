@@ -51,6 +51,9 @@ jobs:
       - name: Build wheel and source distribution
         run: uv build
 
+      - name: Verify embedded wheel resources
+        run: uv run python -m dlss5_enabler.verify_wheel dist
+
       - name: Upload distributions
         uses: actions/upload-artifact@v4
         with:

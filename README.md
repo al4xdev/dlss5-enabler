@@ -3,7 +3,7 @@
 Transactional command-line installer for the DLSS5-Feeder rendering stack on Windows, Linux, Wine, Proton, and SteamOS.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-165%20passing-brightgreen)](tests/)
+[![CI](https://github.com/al4xdev/dlss5-enabler/actions/workflows/ci.yml/badge.svg)](https://github.com/al4xdev/dlss5-enabler/actions/workflows/ci.yml)
 [![Typing](https://img.shields.io/badge/typing-mypy%20%2B%20pyright%20strict-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
@@ -38,8 +38,10 @@ The project is built to fail safely when downloads, permissions, extraction, or 
 - **Concurrent-operation locks:** per-game operations and shared state use filesystem locks to prevent overlapping writes.
 - **Non-destructive backups:** existing files receive unique backup names; an older backup is never silently overwritten.
 - **Validated downloads:** HTTPS certificate verification remains enabled, incomplete downloads use isolated temporary files, and an existing valid destination survives a failed refresh.
+- **Validated fallback:** incompatible latest artifacts produce a warning and fall back to a pinned revision with an exact SHA-256 check.
 - **Safe extraction:** archive members are checked for absolute paths, parent traversal, and flattened-name collisions before extraction.
 - **Cache identity checks:** cached components are tied to their source URL, version or revision, and SHA-256 digest.
+- **Preflight resolution:** every required upstream is downloaded and validated before an existing installation is removed or a game file is changed.
 - **Strict verification:** Ruff, Mypy strict, Pyright strict, and the complete test suite run through one command.
 
 These protections reduce the chance of a broken game directory, but they cannot guarantee compatibility with every game, mod loader, anti-cheat system, or upstream release.
@@ -59,24 +61,35 @@ The target must be a Windows PE executable, either running directly on Windows o
 ## Requirements
 
 - Python 3.10 or newer
-- [`uv`](https://docs.astral.sh/uv/)
+- [`uv`](https://docs.astral.sh/uv/) (recommended) or pip
 - An NVIDIA RTX GPU supported by the downloaded NGX runtime
 - A game installation you can write to
 - Internet access for the first component download
 
 ## Install
 
-Install the command in an isolated environment with `uv`:
+Run the latest release without installing it:
 
 ```console
-uv tool install dlss5-enabler
+uvx dlss5-enabler@latest --help
+uvx dlss5-enabler@latest info "/path/to/game.exe"
+uvx dlss5-enabler@latest install "/path/to/game.exe"
+```
+
+For frequent use, install the latest release persistently with `uv`:
+
+```console
+uv tool install dlss5-enabler@latest
 dlss5-enabler --help
 ```
 
-Run it once without installing:
+Update a persistent `uv` installation with `uv tool upgrade dlss5-enabler`.
+
+### Install with pip
 
 ```console
-uvx dlss5-enabler --help
+python -m pip install --upgrade dlss5-enabler
+dlss5-enabler --help
 ```
 
 ### Run from source
@@ -93,13 +106,13 @@ uv run dlss5-enabler install "/path/to/game.exe"
 On Windows, PowerShell and `cmd.exe` paths work normally:
 
 ```console
-uv run dlss5-enabler install "C:\Games\Example\game.exe"
+dlss5-enabler install "C:\Games\Example\game.exe"
 ```
 
 On SteamOS or Linux, point to the Windows executable inside the Steam library:
 
 ```console
-uv run dlss5-enabler install "/home/deck/.local/share/Steam/steamapps/common/Example/game.exe"
+dlss5-enabler install "/home/deck/.local/share/Steam/steamapps/common/Example/game.exe"
 ```
 
 When the matching Proton prefix can be identified, the tool updates the required Wine DLL override and prints the corresponding Steam launch options.
@@ -109,15 +122,15 @@ When the matching Proton prefix can be identified, the tool updates the required
 ### Inspect a game
 
 ```console
-uv run dlss5-enabler info "/path/to/game.exe"
+dlss5-enabler info "/path/to/game.exe"
 ```
 
-Reports architecture, imported graphics APIs, write access, the current managed installation, and a detected Proton prefix.
+Reports architecture, imported graphics APIs, write access, installed and current tool versions, saved options, component versions, and a detected Proton prefix.
 
 ### Install
 
 ```console
-uv run dlss5-enabler install [OPTIONS] "/path/to/game.exe"
+dlss5-enabler install [OPTIONS] "/path/to/game.exe"
 ```
 
 Options:
@@ -133,10 +146,18 @@ Options:
 
 `--d3d9` and `--opengl` cannot be combined.
 
+### Update a managed game
+
+```console
+dlss5-enabler update "/path/to/game.exe"
+```
+
+`update` reads the installation metadata beside the game, then transactionally reapplies the same LumeniteFX, D3D9, OpenGL, and Vulkan choices with the components managed by the current CLI. Use `--reinstall` to reapply an already-current installation or `--force-download` to bypass component caches. A game installed by a newer CLI is never downgraded.
+
 ### Uninstall
 
 ```console
-uv run dlss5-enabler uninstall "/path/to/game.exe"
+dlss5-enabler uninstall "/path/to/game.exe"
 ```
 
 The target may be the game executable or its directory. Only files and settings recorded by DLSS5 Enabler are reverted.
@@ -144,29 +165,34 @@ The target may be the game executable or its directory. Only files and settings 
 ### List managed games
 
 ```console
-uv run dlss5-enabler list
+dlss5-enabler list
 ```
+
+The list compares each saved installation version with the running CLI locally; it does not make one network request per game.
 
 ### Inspect or clear the download cache
 
 ```console
-uv run dlss5-enabler cache
-uv run dlss5-enabler cache --clean
+dlss5-enabler cache
+dlss5-enabler cache --clean
 ```
 
-### Run project verification
+### Show or check the CLI version
 
 ```console
-uv run dlss5-enabler check
+dlss5-enabler version
+dlss5-enabler version --check
 ```
+
+`install`, `update`, `info`, and `list` perform a non-blocking PyPI version check at most once every 24 hours per shared cache. The marker is empty and stores no version data. A newer release only produces an update recommendation; the CLI never updates itself. Use `uv tool upgrade dlss5-enabler` or `python -m pip install --upgrade dlss5-enabler` to update explicitly.
 
 ## Installation pipeline
 
 An installation runs these stages in order:
 
 1. Validate the executable, architecture, graphics API hints, permissions, and requested mode.
-2. Snapshot and remove a previous managed installation when refreshing.
-3. Discover and fetch upstream components.
+2. Discover, download, and validate every required upstream component.
+3. Snapshot and remove a previous managed installation when refreshing.
 4. Install or extract the correct ReShade Addon DLL.
 5. Configure dgVoodoo2 when DirectX 9 translation is requested.
 6. Place the Feeder addon, shader, and ReShade headers.
@@ -178,6 +204,14 @@ An installation runs these stages in order:
 12. Atomically save `dlss5-enabler.install.json` and update the global index.
 
 If a stage fails, recorded mutations are reversed and any previous managed installation snapshot is restored.
+
+## Upstream fallback policy
+
+The wheel contains `dlss5_enabler/upstreams.json`, which pins a known-compatible fallback for every downloaded component. A normal installation still tries the newest upstream revision first. The candidate is downloaded to an isolated temporary file and checked for HTTPS provenance, size or digest when published, archive safety, required contents, supported layout, and architecture before entering the cache.
+
+When the latest revision cannot be discovered, downloaded, or validated, the CLI emits an `UPSTREAM_*` warning and tries the pinned fallback. A fallback is accepted only when its exact SHA-256 and content policy match the embedded manifest. The successful installation summary lists every fallback used. If both candidates fail, the command stops without cleaning an existing installation or modifying the game.
+
+The main warning codes distinguish discovery, missing or ambiguous assets, timeout, rejected HTTP responses, digest mismatch, unsafe archives, missing content, unsupported formats, fallback use, and fallback failure. The detailed log includes the component and revisions involved without exposing authenticated URLs.
 
 ## Local state
 
@@ -195,13 +229,15 @@ The log file is named `dlss5-enabler.log`.
 dlss5_enabler/
 ├── core/          Binary inspection, exact-case INI handling, records, atomic I/O
 ├── network/       HTTPS downloads, release discovery, cache validation
-├── operations/    Transactional install and uninstall pipelines
+├── operations/    Transactional install, update, and uninstall pipelines
 ├── platform/      Windows, Linux, Wine, Proton, and Steam discovery adapters
 ├── check.py       Unified quality runner
 └── cli.py         Typer command-line interface
 ```
 
 The Python import namespace uses an underscore (`dlss5_enabler`); the package and executable use a hyphen (`dlss5-enabler`).
+
+GitHub is implemented behind the provider-neutral download-source contract in `network/adapters.py`. Release, repository-file, snapshot, and archive discovery stay in the adapter; component validation and fallback policy stay in the resolver. A future mirror should implement the same adapter contract and return the same neutral asset models instead of adding provider-specific branches to component code.
 
 ## Development
 
@@ -212,6 +248,8 @@ uv sync
 uv run dlss5-enabler check
 ```
 
+`uv run` is reserved for commands executed from a project checkout. Installed users should use `dlss5-enabler` directly or `uvx dlss5-enabler@latest` for ephemeral execution.
+
 The unified check requires all of the following to pass with no warnings:
 
 - Ruff formatting
@@ -219,6 +257,14 @@ The unified check requires all of the following to pass with no warnings:
 - Mypy strict type checking
 - Pyright strict type checking
 - Pytest
+
+Maintainers can inspect a candidate pin without modifying the manifest:
+
+```console
+uv run dlss5-enabler-update-upstream COMPONENT REVISION ASSET_NAME HTTPS_URL
+```
+
+The command downloads to a temporary directory, validates the component layout, and prints the resolved revision, size, SHA-256, and recognized format. Add `--write --manifest dlss5_enabler/upstreams.json` only after reviewing that output; the tool never chooses `latest` or rewrites the manifest implicitly.
 
 ## Upstream projects
 
