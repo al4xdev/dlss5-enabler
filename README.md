@@ -64,9 +64,24 @@ The target must be a Windows PE executable, either running directly on Windows o
 - A game installation you can write to
 - Internet access for the first component download
 
-## Run from source
+## Install
 
-The package has not been published yet. From this repository:
+Install the command in an isolated environment with `uv`:
+
+```console
+uv tool install dlss5-enabler
+dlss5-enabler --help
+```
+
+Run it once without installing:
+
+```console
+uvx dlss5-enabler --help
+```
+
+### Run from source
+
+From a local checkout:
 
 ```console
 uv sync
