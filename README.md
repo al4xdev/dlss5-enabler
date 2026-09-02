@@ -221,3 +221,13 @@ Each downloaded component remains subject to its upstream license and terms.
 ## License
 
 DLSS5 Enabler itself is distributed under the [MIT License](LICENSE).
+
+## Disclaimer
+
+DLSS5 Enabler is an independent, unofficial community project. It is not an NVIDIA product, is not affiliated with NVIDIA Corporation, and is not sponsored, reviewed, approved, or endorsed by NVIDIA or any of the upstream projects named in this document. NVIDIA, DLSS, GeForce, and related names and marks belong to NVIDIA Corporation in the United States and other countries. Other names and marks belong to their respective owners.
+
+The maintainer develops only the installer and orchestration code in this repository. The maintainer does not create, own, host, bundle, redistribute, audit, warrant, support, or maintain NVIDIA DLSS/NGX binaries or the third-party components installed by this tool. DLSS5 Enabler only discovers release information and directs downloads to the original upstream websites, repositories, manifests, or content servers at runtime. Availability, licensing, integrity, compatibility, behavior, and support for those downloads remain the responsibility of their respective providers.
+
+Report problems with DLSS5 Enabler's installation, rollback, detection, or command-line behavior in this project's issue tracker. Report problems inside DLSS, DLSS5-Feeder, RenoDX, ReShade, LumeniteFX, dgVoodoo2, or another downloaded component to that component's own maintainer.
+
+Use this tool at your own risk. Back up important game files and respect each game's modding, multiplayer, and anti-cheat policies. No guarantee is made that any particular game, driver, GPU, mod stack, or future upstream release will work.
