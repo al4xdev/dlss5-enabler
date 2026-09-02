@@ -58,7 +58,8 @@ def _atomic_copy_file_unlocked(src: Path, target: Path) -> None:
     temp = Path(temp_name)
     try:
         shutil.copy2(src, temp)
-        with temp.open("rb") as stream:
+        with temp.open("r+b") as stream:
+            stream.flush()
             os.fsync(stream.fileno())
         temp.replace(target)
     except Exception:
