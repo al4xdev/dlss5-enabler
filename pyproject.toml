@@ -1,0 +1,112 @@
+[project]
+name = "dlss5-enabler"
+version = "1.0.0"
+description = "Transactional cross-platform installer for the DLSS5-Feeder, RenoDX, ReShade, and LumeniteFX stack"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Alex", email = "alex@users.noreply.github.com" },
+]
+keywords = [
+    "dlss",
+    "dlss5",
+    "renodx",
+    "dlaa",
+    "reshade",
+    "gaming",
+    "graphics",
+    "proton",
+    "wine",
+    "steam-deck",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Games/Entertainment",
+]
+dependencies = [
+    "filelock>=3.16.0",
+    "httpx>=0.27.0",
+    "rich>=13.7.0",
+    "typer>=0.12.0",
+    "pydantic>=2.7.0",
+    "py7zr>=0.21.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.10.0",
+    "pyright>=1.1.360",
+    "pytest>=8.0.0",
+    "pytest-mock>=3.14.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+dlss5-enabler = "dlss5_enabler.cli:app"
+dlss5-enabler-check = "dlss5_enabler.check:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dlss5_enabler"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+
+[tool.pyright]
+include = ["dlss5_enabler", "tests"]
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownVariableType = true
+reportUnknownArgumentType = true
+reportUnknownParameterType = true
+reportUntypedFunctionDecorator = false
+reportPrivateUsage = false
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W", "I", "N", "UP", "B", "A", "C4", "PIE", "T20", "Q",
+    "RET", "SIM", "ARG", "PTH", "ERA", "PGH", "PL", "TRY", "PERF", "RUF"
+]
+ignore = [
+    "TRY003", "EM101", "EM102", "PLR0913", "PLR0912", "PLR0915", "PLR2004",
+    "PLR0917", "TRY401", "PERF203", "TRY300", "TRY400", "B027", "PTH110", "PTH107"
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG001", "ARG002", "ARG005", "PLR2004", "S101", "PLW0603", "PLR0914", "B017"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
