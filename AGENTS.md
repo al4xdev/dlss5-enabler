@@ -50,7 +50,7 @@ dlss5_enabler/
 └── cli.py                Typer interface
 ```
 
-Tests live in `tests/`, workflows in `.github/workflows/`, and executable implementation plans in `.plans/`.
+Tests live in `tests/`, workflows in `.github/workflows/`, and executable implementation plans in `.plan/`.
 
 ## 3. Python tooling and environment
 
@@ -66,7 +66,7 @@ Tests live in `tests/`, workflows in `.github/workflows/`, and executable implem
 
 ### 4.1 Zero comments and zero docstrings in the package
 
-Python files under `dlss5_enabler/` must not contain inline comments or internal docstrings. Documentation belongs in `README.md`, this file, or `.plans/`.
+Python files under `dlss5_enabler/` must not contain inline comments or internal docstrings. Documentation belongs in `README.md`, this file, or `.plan/`.
 
 This rule does not prohibit user-facing strings, error messages, metadata, or Markdown documentation.
 
@@ -223,7 +223,7 @@ A network failure while reading status does not imply a failed deployment. Do no
 
 ## 11. Plans and documentation
 
-- New plans belong in `.plans/`.
+- New plans belong in `.plan/`.
 - Read a complete plan before implementing it.
 - Treat plans as specifications and change them only when the user asks.
 - After implementing a plan, verify every acceptance criterion against the code and tests.
