@@ -30,7 +30,7 @@ def test_cli_help() -> None:
 
 
 def test_cli_list_empty(mocker: MockerFixture) -> None:
-    mocker.patch("dlss5_enabler.cli.index_load", return_value=[])
+    mocker.patch("dlss5_enabler.cli.index_load_active", return_value=[])
     res = runner.invoke(app, ["list"], terminal_width=200)
     assert res.exit_code == 0
     assert "No installed games found" in res.stdout
@@ -47,7 +47,7 @@ def test_cli_list_with_entries(mocker: MockerFixture) -> None:
             tool_version="1.0.0",
         ),
     ]
-    mocker.patch("dlss5_enabler.cli.index_load", return_value=entries)
+    mocker.patch("dlss5_enabler.cli.index_load_active", return_value=entries)
     mocker.patch("dlss5_enabler.cli.get_tool_version", return_value="1.1.0")
     res = runner.invoke(app, ["list"], terminal_width=200)
     assert res.exit_code == 0
@@ -266,7 +266,7 @@ def test_cli_update_warning_shows_uv_and_pip(
         check_performed=True,
         update_available=True,
     )
-    mocker.patch("dlss5_enabler.cli.index_load", return_value=[])
+    mocker.patch("dlss5_enabler.cli.index_load_active", return_value=[])
 
     result = runner.invoke(app, ["list"])
 
@@ -285,7 +285,7 @@ def test_cli_update_check_failure_does_not_change_command_exit(
         check_performed=True,
         error="offline",
     )
-    mocker.patch("dlss5_enabler.cli.index_load", return_value=[])
+    mocker.patch("dlss5_enabler.cli.index_load_active", return_value=[])
 
     result = runner.invoke(app, ["list"])
 

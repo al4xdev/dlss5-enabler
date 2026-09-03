@@ -19,7 +19,7 @@ if sys.platform == "win32":
 from dlss5_enabler.check import run_all_checks
 from dlss5_enabler.core.logger import get_log_dir, get_logger, setup_logger
 from dlss5_enabler.core.pe import check_api_mismatches, detect_game_apis, detect_pe_arch
-from dlss5_enabler.core.record import index_load, record_load
+from dlss5_enabler.core.record import index_load_active, record_load
 from dlss5_enabler.core.util import file_is_writable, get_cache_dir, get_permission_guidance, is_directory_writable
 from dlss5_enabler.core.version import InstallVersionStatus, get_install_version_status, get_tool_version
 from dlss5_enabler.network.update_check import UpdateCheckResult, check_for_update
@@ -295,7 +295,7 @@ def update_cmd(
 @app.command(name="list")
 def list_cmd() -> None:
     _check_cli_update()
-    entries = index_load()
+    entries = index_load_active()
     if not entries:
         console.print("[dim]No installed games found in DLSS5 Enabler index.[/dim]")
         return

@@ -13,6 +13,7 @@ from dlss5_enabler.core.record import (
     RecordedFile,
     index_add,
     index_load,
+    index_load_active,
     index_remove,
     index_save,
     record_exists,
@@ -167,6 +168,52 @@ def test_global_index_operations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     # Remove non-existent returns True
     assert index_remove("C:/nonexistent")
     assert len(index_load()) == 1
+
+
+def test_index_load_active_prunes_stale_entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_index = tmp_path / "appdata" / "installs.json"
+    fake_index.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("dlss5_enabler.core.record.get_global_index_path", lambda: fake_index)
+    monkeypatch.setattr("dlss5_enabler.core.record.gettempdir", lambda: str(tmp_path / "unrelated-temp"))
+    game_dir = tmp_path / "game"
+    game_dir.mkdir()
+    game_exe = game_dir / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    active_record = InstallRecord(game_exe=str(game_exe), game_dir=str(game_dir))
+    assert record_save(active_record)
+    active_entry = IndexEntry(
+        game_exe=active_record.game_exe,
+        game_dir=active_record.game_dir,
+        timestamp=active_record.timestamp,
+    )
+    stale_entry = IndexEntry(
+        game_exe=str(tmp_path / "missing" / "game.exe"),
+        game_dir=str(tmp_path / "missing"),
+        timestamp="2026-01-01T00:00:00+00:00",
+    )
+    assert index_save([active_entry, stale_entry])
+
+    active = index_load_active()
+
+    assert [entry.game_exe for entry in active] == [active_entry.game_exe]
+    assert [entry.game_exe for entry in index_load()] == [active_entry.game_exe]
+
+
+def test_index_load_active_prunes_temporary_entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_index = tmp_path / "appdata" / "installs.json"
+    fake_index.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("dlss5_enabler.core.record.get_global_index_path", lambda: fake_index)
+    monkeypatch.setattr("dlss5_enabler.core.record.gettempdir", lambda: str(tmp_path))
+    game_dir = tmp_path / "game"
+    game_dir.mkdir()
+    game_exe = game_dir / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    record = InstallRecord(game_exe=str(game_exe), game_dir=str(game_dir))
+    assert record_save(record)
+    assert index_save([IndexEntry(game_exe=record.game_exe, game_dir=record.game_dir, timestamp=record.timestamp)])
+
+    assert index_load_active() == []
+    assert index_load() == []
 
 
 def test_index_load_corrupted_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

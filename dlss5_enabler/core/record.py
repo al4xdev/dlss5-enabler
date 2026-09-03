@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import gettempdir
 from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -180,6 +181,40 @@ def index_load() -> list[IndexEntry]:
     try:
         with resource_lock(p):
             return _index_load_unlocked(p)
+    except Exception:
+        return []
+
+
+def _index_entry_is_active(entry: IndexEntry) -> bool:
+    try:
+        game_dir = Path(entry.game_dir)
+        game_exe = Path(entry.game_exe)
+        if (
+            game_dir.resolve().is_relative_to(Path(gettempdir()).resolve())
+            or not game_dir.is_dir()
+            or not game_exe.is_file()
+        ):
+            return False
+        record = record_load(game_dir)
+        if record is None:
+            return False
+        return (
+            Path(record.game_dir).resolve() == game_dir.resolve()
+            and Path(record.game_exe).resolve() == game_exe.resolve()
+        )
+    except OSError:
+        return False
+
+
+def index_load_active() -> list[IndexEntry]:
+    p = get_global_index_path()
+    try:
+        with resource_lock(p):
+            entries = _index_load_unlocked(p)
+            active = [entry for entry in entries if _index_entry_is_active(entry)]
+            if len(active) != len(entries):
+                _index_save_unlocked(p, active)
+            return active
     except Exception:
         return []
 
