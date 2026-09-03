@@ -41,6 +41,7 @@ from dlss5_enabler.operations.steps import (
     StepFetchUpstream,
     StepInjectFeederAndHeaders,
     StepInjectRenoDxAndNgx,
+    StepInstallD3D9Translation,
     StepInstallReShade,
     StepInstallVulkanLayer,
     StepMirrorDualLocations,
@@ -242,6 +243,30 @@ def test_step_fetch_upstream_skips_feeder_components_for_native_dlss(tmp_path: P
     fetches["fetch_reshade"].assert_called_once()
     fetches["fetch_renodx_dlss5"].assert_called_once()
     fetches["fetch_ngx_dlls"].assert_called_once()
+
+
+def test_d3d9_translation_disables_dgvoodoo_watermark(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    d3d9_dll = source_dir / "D3D9.dll"
+    cpl = source_dir / "dgVoodooCpl.exe"
+    conf = source_dir / "dgVoodoo.conf"
+    d3d9_dll.write_bytes(b"D3D9")
+    cpl.write_bytes(b"CPL")
+    conf.write_text("[DirectX]\ndgVoodooWatermark=true\n", encoding="utf-8")
+    bundle = DgvoodooBundle()
+    bundle.d3d9_dll = d3d9_dll
+    bundle.cpl = cpl
+    bundle.conf = conf
+    ctx = PipelineContext(game_exe=tmp_path / "game.exe", d3d9_translate=True)
+    ctx.game_dir = tmp_path
+    ctx.reshade_dir = tmp_path
+    ctx.dgvoodoo_bundle = bundle
+    ctx.record = InstallRecord(game_exe=str(ctx.game_exe), game_dir=str(tmp_path))
+
+    assert StepInstallD3D9Translation().execute(ctx)
+    installed_conf = (tmp_path / "dgVoodoo.conf").read_text(encoding="utf-8")
+    assert "dgVoodooWatermark=false" in installed_conf
 
 
 def test_native_dlss_installs_headers_without_feeder_components(tmp_path: Path) -> None:

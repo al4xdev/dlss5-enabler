@@ -475,7 +475,7 @@ class StepInstallD3D9Translation(PipelineStep):
             ("DirectX", "DisableAndPassThru", "false"),
             ("DirectX", "VideoCard", "internal3D"),
             ("DirectX", "VRAM", "1024"),
-            ("DirectX", "dgVoodooWatermark", "true"),
+            ("DirectX", "dgVoodooWatermark", "false"),
             ("General", "OutputAPI", "d3d11_fl11_0"),
         ]
         for sec, k, v in dg_settings:
