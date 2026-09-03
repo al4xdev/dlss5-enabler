@@ -1,5 +1,6 @@
 import contextlib
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -48,6 +49,43 @@ class WindowsAdapter(PlatformAdapter):
 
     def is_wsl(self) -> bool:
         return False
+
+    def is_game_running(self, executable: Path | str) -> bool:
+        target = Path(executable).resolve()
+        name = target.name
+        if not name:
+            return False
+        escaped_name = name.replace("'", "''")
+        try:
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    (
+                        "$ErrorActionPreference = 'Stop'; "
+                        f"Get-CimInstance -ClassName Win32_Process -Filter \"Name = '{escaped_name}'\" | "
+                        "ForEach-Object { $_.ExecutablePath }"
+                    ),
+                ],
+                capture_output=True,
+                check=False,
+                encoding="utf-8",
+                errors="replace",
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if result.returncode != 0:
+            return False
+        target_key = os.path.normcase(str(target))
+        return any(
+            os.path.normcase(str(Path(path.strip()).resolve())) == target_key
+            for path in result.stdout.splitlines()
+            if path.strip()
+        )
 
     def is_directory_writable(self, directory: Path | str) -> bool:
         p = Path(directory)

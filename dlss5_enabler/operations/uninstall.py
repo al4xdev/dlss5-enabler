@@ -9,6 +9,7 @@ from dlss5_enabler.core.fileio import atomic_copy_file, resource_lock
 from dlss5_enabler.core.ini import ini_set_exact
 from dlss5_enabler.core.record import InstallRecord, RecordedFile, index_add, index_remove, record_load
 from dlss5_enabler.core.util import remove_dir_if_empty
+from dlss5_enabler.platform import get_platform_adapter
 from dlss5_enabler.platform.proton import ProtonManager, WineRegParser
 
 LogFn = Callable[[str], None] | Any
@@ -175,10 +176,20 @@ def run_uninstall(game_dir_or_exe: Path | str, log: LogFn = print, lock_operatio
     game_dir = target if target.is_dir() else target.parent
     if lock_operation:
         with resource_lock(game_dir / ".dlss5-enabler-install-operation"):
-            return run_uninstall(game_dir, log=log, lock_operation=False)
+            return _run_uninstall_unlocked(game_dir, log)
+    return _run_uninstall_unlocked(game_dir, log)
+
+
+def _run_uninstall_unlocked(game_dir: Path, log: LogFn) -> bool:
     rec = record_load(game_dir)
     if not rec:
         log(f"No DLSS5 Enabler install record found in {game_dir} - nothing to uninstall.")
+        return False
+    game_exe = Path(rec.game_exe)
+    if not game_exe.is_absolute():
+        game_exe = game_dir / game_exe
+    if get_platform_adapter().is_game_running(game_exe):
+        log(f"Cannot uninstall while {game_exe.name} is running. Close the game and try again.")
         return False
 
     log(f"Uninstalling DLSS5 Enabler files from {game_dir}...")

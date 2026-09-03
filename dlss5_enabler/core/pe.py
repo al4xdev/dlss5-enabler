@@ -39,6 +39,10 @@ EM_386 = 0x03
 EM_X86_64 = 0x3E
 EM_AARCH64 = 0xB7
 
+_NATIVE_DLSS_DLLS = frozenset({"nvngx_dlss.dll", "nvngx_dlssg.dll"})
+_NATIVE_DLSS_PLUGIN_ROOTS = ("Engine/Plugins", "Plugins")
+_NATIVE_DLSS_EXECUTABLE_DIRECTORIES = frozenset({"bin", "binaries", "win32", "win64", "x64", "x86"})
+
 
 def detect_binary_format(exe_path: Path | str) -> BinaryFormat:
     path = Path(exe_path)
@@ -204,6 +208,35 @@ def detect_game_apis(exe_path: Path | str) -> list[DetectedApi]:
         apis.append(DetectedApi.VULKAN)
 
     return apis
+
+
+def detect_native_dlss(exe_path: Path | str) -> bool:
+    path = Path(exe_path)
+    imported = set(detect_imported_dlls(path))
+    if imported.intersection(_NATIVE_DLSS_DLLS):
+        return True
+    roots = [path.parent]
+    current = path.parent
+    for _ in range(3):
+        if current.name.lower() not in _NATIVE_DLSS_EXECUTABLE_DIRECTORIES or current.parent == current:
+            break
+        current = current.parent
+        roots.append(current)
+    if len(roots) > 1 and roots[-1].parent != roots[-1]:
+        roots.append(roots[-1].parent)
+    for root in roots:
+        try:
+            if any(item.is_file() and item.name.lower() in _NATIVE_DLSS_DLLS for item in root.iterdir()):
+                return True
+            for relative_plugin_root in _NATIVE_DLSS_PLUGIN_ROOTS:
+                plugin_root = root / relative_plugin_root
+                if plugin_root.is_dir() and any(
+                    artifact.is_file() for name in _NATIVE_DLSS_DLLS for artifact in plugin_root.rglob(name)
+                ):
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def check_api_mismatches(

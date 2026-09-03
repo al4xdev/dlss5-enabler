@@ -81,6 +81,7 @@ class InstallRecord(BaseModel):
     reshade_by_us: bool = False
     vulkan_layer: bool = False
     lumenite_installed: bool = True
+    native_dlss_detected: bool = False
     install_options: InstallOptions = Field(default_factory=InstallOptions)
     platform: str = "windows"
     proton_prefix: str = ""

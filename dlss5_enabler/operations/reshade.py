@@ -16,6 +16,22 @@ from dlss5_enabler.core.record import IniTouch, InstallRecord
 logger = get_logger("reshade")
 
 
+def _normalize_search_path_list(value: str, default: str) -> str:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_path in value.split(","):
+        path = raw_path.strip().replace("/", "\\")
+        while "**\\**" in path:
+            path = path.replace("**\\**", "**")
+        if path in {"", ".", ".\\"}:
+            continue
+        key = path.lower()
+        if key not in seen:
+            normalized.append(path)
+            seen.add(key)
+    return ",".join(normalized) if normalized else default
+
+
 def _register_archive_destination(destinations: set[Path], target: Path, member: str) -> None:
     if target in destinations:
         raise ValueError(f"Duplicate embedded archive member: {member}")
@@ -111,21 +127,12 @@ def normalize_search_paths(
         return True
 
     keys: list[tuple[str, str]] = [
-        ("EffectSearchPaths", "./reshade-shaders/Shaders/**"),
-        ("TextureSearchPaths", "./reshade-shaders/Textures/**"),
+        ("EffectSearchPaths", ".\\reshade-shaders\\Shaders\\**"),
+        ("TextureSearchPaths", ".\\reshade-shaders\\Textures\\**"),
     ]
     for key_name, default_val in keys:
         had, orig = ini_get_exact(ini_path, "GENERAL", key_name)
-        fixed = orig if had else ""
-        while "**\\**" in fixed:
-            fixed = fixed.replace("**\\**", "**")
-        while "**/**" in fixed:
-            fixed = fixed.replace("**/**", "**")
-
-        if fixed in [".\\", "./", ".", ""]:
-            fixed = default_val
-
-        fixed = fixed.replace("\\", "/")
+        fixed = _normalize_search_path_list(orig if had else "", default_val)
 
         if fixed != orig:
             if not ini_set_exact(ini_path, "GENERAL", key_name, fixed):

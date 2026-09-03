@@ -69,6 +69,10 @@ class LinuxAdapter(PlatformAdapter):
                 pass
         return False
 
+    def is_game_running(self, executable: Path | str) -> bool:
+        _ = executable
+        return False
+
     def is_directory_writable(self, directory: Path | str) -> bool:
         p = Path(directory)
         if not p.exists() or not p.is_dir():

@@ -25,7 +25,7 @@ from dlss5_enabler.core.version import InstallVersionStatus, get_install_version
 from dlss5_enabler.network.update_check import UpdateCheckResult, check_for_update
 from dlss5_enabler.operations.install import run_install
 from dlss5_enabler.operations.uninstall import run_uninstall
-from dlss5_enabler.operations.update import run_update
+from dlss5_enabler.operations.update import GameUpdateStatus, run_update
 from dlss5_enabler.platform import ProtonManager, get_platform_adapter
 
 app: typer.Typer = typer.Typer(
@@ -62,6 +62,43 @@ def _check_cli_update(*, force: bool = False) -> UpdateCheckResult:
     result = check_for_update(force=force)
     _show_update_check(result)
     return result
+
+
+def _show_reshade_activation_guide(lumenite: bool, native_dlss: bool = False) -> None:
+    if native_dlss:
+        console.print(
+            Panel.fit(
+                "[bold cyan]Native DLSS path selected[/bold cyan]\n\n"
+                "This game already provides DLSS calls, so DLSS5-Feeder was not installed.\n\n"
+                "1. Start the game and press [bold]Home[/bold].\n"
+                "2. If the game's native motion vectors are unusable, enable [bold]LUMENITE: Kernel 2.0[/bold] "
+                "and place it at the top. Test with it both enabled and disabled.\n\n"
+                "[yellow]Do not install or enable DLSS 5 Feed for this game.[/yellow]",
+                title="[bold cyan]Activate ReShade add-on[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+        return
+    motion_vector_provider = (
+        "[green]\u2610[/] [bold]LUMENITE: Kernel 2.0[/] [dim][lumenite_Kernel.fx][/dim]"
+        if lumenite
+        else "[yellow]\u2610[/] [bold]A compatible motion-vector provider[/]"
+    )
+    console.print(
+        Panel.fit(
+            "[bold cyan]One final ReShade step is required[/bold cyan]\n\n"
+            "1. Start the game, wait for the initial shader compilation, then press [bold]Home[/bold].\n"
+            "2. In [bold]Home[/bold], enable these effects and use [bold]Active to top[/bold]:\n"
+            f"   {motion_vector_provider}\n"
+            "   [green]\u2610[/] [bold]DLSS 5 Feed[/] [dim][DLSS5_Feed.fx][/dim]\n\n"
+            "[yellow]Lumenite is recommended when the game does not expose usable motion vectors; "
+            "test with it enabled and disabled.[/yellow]\n"
+            "[yellow]Required order, top to bottom:[/yellow] motion-vector provider \u2192 DLSS 5 Feed. "
+            "You may enable other effects after these two.",
+            title="[bold cyan]Activate ReShade effects[/bold cyan]",
+            border_style="cyan",
+        )
+    )
 
 
 def _path_size(path: Path) -> int:
@@ -188,6 +225,7 @@ def install_cmd(
                 border_style="green",
             )
         )
+    _show_reshade_activation_guide(lumenite, rec.native_dlss_detected if rec is not None else False)
 
 
 @app.command(name="uninstall")
@@ -246,6 +284,12 @@ def update_cmd(
     console.print(f"[bold {style}]{result.message}[/bold {style}]")
     if not result.success:
         raise typer.Exit(code=1)
+    if result.status in {GameUpdateStatus.UPDATED, GameUpdateStatus.REINSTALLED}:
+        record = record_load(Path(target).parent if Path(target).is_file() else Path(target))
+        _show_reshade_activation_guide(
+            result.options.lumenite if result.options is not None else True,
+            record.native_dlss_detected if record is not None else False,
+        )
 
 
 @app.command(name="list")

@@ -32,6 +32,9 @@ class PlatformAdapter(abc.ABC):
     def is_wsl(self) -> bool: ...
 
     @abc.abstractmethod
+    def is_game_running(self, executable: Path | str) -> bool: ...
+
+    @abc.abstractmethod
     def is_directory_writable(self, directory: Path | str) -> bool: ...
 
     @abc.abstractmethod

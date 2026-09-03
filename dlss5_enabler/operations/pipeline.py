@@ -48,6 +48,8 @@ class PipelineContext:
     reshade_api: str = "dxgi"
     reshade_dll_name: str = "dxgi.dll"
     need_reshade: bool = True
+    native_dlss_detected: bool = False
+    install_feeder: bool = True
 
     reshade_bundle: ReshadeBundle | None = None
     feeder_bundle: FeederBundle | None = None

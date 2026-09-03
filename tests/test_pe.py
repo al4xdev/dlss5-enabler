@@ -13,6 +13,7 @@ from dlss5_enabler.core.pe import (
     check_api_mismatches,
     detect_game_apis,
     detect_imported_dlls,
+    detect_native_dlss,
     detect_pe_arch,
 )
 
@@ -171,6 +172,39 @@ def test_detect_imported_dlls_and_apis(tmp_path: Path) -> None:
 
 def test_detect_imported_dlls_missing_file(tmp_path: Path) -> None:
     assert detect_imported_dlls(tmp_path / "missing.exe") == []
+
+
+def test_detect_native_dlss_from_import(tmp_path: Path) -> None:
+    target = tmp_path / "native_dlss.exe"
+    target.write_bytes(_create_mock_pe(imported_dlls=["nvngx_dlss.dll"]))
+
+    assert detect_native_dlss(target)
+
+
+def test_detect_native_dlss_from_game_local_runtime(tmp_path: Path) -> None:
+    target = tmp_path / "native_dlss.exe"
+    target.write_bytes(_create_mock_pe())
+    (tmp_path / "NVNGX_DLSS.DLL").write_bytes(b"runtime")
+
+    assert detect_native_dlss(target)
+
+
+def test_detect_native_dlss_from_unreal_plugin_runtime(tmp_path: Path) -> None:
+    target = tmp_path / "game" / "Binaries" / "Win64" / "game.exe"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(_create_mock_pe())
+    runtime = tmp_path / "game" / "Engine" / "Plugins" / "DLSS" / "Binaries" / "nvngx_dlss.dll"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_bytes(b"runtime")
+
+    assert detect_native_dlss(target)
+
+
+def test_detect_native_dlss_returns_false_without_runtime(tmp_path: Path) -> None:
+    target = tmp_path / "no_dlss.exe"
+    target.write_bytes(_create_mock_pe())
+
+    assert not detect_native_dlss(target)
 
 
 def test_check_api_mismatches_warnings(tmp_path: Path) -> None:

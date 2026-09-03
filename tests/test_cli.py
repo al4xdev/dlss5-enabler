@@ -112,6 +112,26 @@ def test_cli_install_command_success(tmp_path: Path, mocker: MockerFixture) -> N
 
     res = runner.invoke(app, ["install", str(game_exe)])
     assert res.exit_code == 0
+    assert "Activate ReShade effects" in res.stdout
+    assert "LUMENITE: Kernel 2.0" in res.stdout
+    assert "DLSS 5 Feed" in res.stdout
+
+
+def test_cli_install_shows_native_dlss_activation_guide(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    mocker.patch("dlss5_enabler.cli.run_install", return_value=True)
+    mocker.patch(
+        "dlss5_enabler.cli.record_load",
+        return_value=InstallRecord(game_exe=str(game_exe), game_dir=str(tmp_path), native_dlss_detected=True),
+    )
+
+    res = runner.invoke(app, ["install", str(game_exe)])
+
+    assert res.exit_code == 0
+    assert "Native DLSS path selected" in res.stdout
+    assert "Test with it both enabled and disabled" in res.stdout
+    assert "Required order" not in res.stdout
 
 
 def test_cli_install_command_failure(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -325,6 +345,7 @@ def test_cli_update_command_replays_managed_install(tmp_path: Path, mocker: Mock
 
     assert result.exit_code == 0
     assert "Updated successfully" in result.stdout
+    assert "Activate ReShade effects" in result.stdout
     assert update.call_args.kwargs["force_download"] is True
     assert update.call_args.kwargs["verbose"] is True
 
@@ -341,3 +362,4 @@ def test_cli_update_failure_has_nonzero_exit(tmp_path: Path, mocker: MockerFixtu
 
     assert result.exit_code == 1
     assert "Record invalid" in result.stdout
+    assert "Activate ReShade effects" not in result.stdout

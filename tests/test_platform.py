@@ -1,8 +1,10 @@
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from pytest_mock import MockerFixture
 
 from dlss5_enabler.platform import LinuxAdapter, WindowsAdapter, get_platform_adapter
 
@@ -30,10 +32,37 @@ def test_windows_adapter_unblock_and_exec(tmp_path: Path) -> None:
     assert f.is_file()
 
 
+def test_windows_adapter_detects_running_game(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "Control_DX12.exe"
+    result = subprocess.CompletedProcess(
+        args=["powershell.exe"],
+        returncode=0,
+        stdout=f"{game_exe.resolve()}\n",
+        stderr="",
+    )
+    run = mocker.patch("dlss5_enabler.platform.windows.subprocess.run", return_value=result)
+
+    assert WindowsAdapter().is_game_running(game_exe)
+    assert "Get-CimInstance" in run.call_args.args[0][4]
+
+
+def test_windows_adapter_ignores_non_running_game(tmp_path: Path, mocker: MockerFixture) -> None:
+    result = subprocess.CompletedProcess(
+        args=["powershell.exe"],
+        returncode=0,
+        stdout="C:\\Other\\Control_DX12.exe\n",
+        stderr="",
+    )
+    mocker.patch("dlss5_enabler.platform.windows.subprocess.run", return_value=result)
+
+    assert not WindowsAdapter().is_game_running(tmp_path / "Control_DX12.exe")
+
+
 def test_linux_adapter_paths(tmp_path: Path) -> None:
     adapter = LinuxAdapter()
     assert adapter.platform_name == "linux"
     assert adapter.get_curl_command() == ["curl"]
+    assert not adapter.is_game_running(tmp_path / "game.exe")
 
     data_home = tmp_path / "data"
     cache_home = tmp_path / "cache"

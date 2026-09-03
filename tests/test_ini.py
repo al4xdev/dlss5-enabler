@@ -14,7 +14,7 @@ def test_ini_get_exact_non_existent(tmp_path: Path) -> None:
 def test_ini_get_exact_exception(tmp_path: Path) -> None:
     target = tmp_path / "test.ini"
     target.write_text("[GENERAL]\nKey=Value", encoding="utf-8")
-    with patch.object(Path, "read_text", side_effect=OSError("Permission denied")):
+    with patch("dlss5_enabler.core.ini._load_ini_document", return_value=None):
         found, val = ini_get_exact(target, "GENERAL", "Key")
         assert not found
         assert val == ""
@@ -158,6 +158,16 @@ def test_ini_set_exact_update_existing_key(tmp_path: Path) -> None:
     assert other_val == "1"
 
 
+def test_ini_set_exact_preserves_reshade_bom_and_line_endings(tmp_path: Path) -> None:
+    target = tmp_path / "ReShade.ini"
+    original = b"\xef\xbb\xbf[GENERAL]\r\nEffectSearchPaths=.\\reshade-shaders\\Shaders\\**\\**\r\n"
+    target.write_bytes(original)
+
+    assert ini_set_exact(target, "GENERAL", "EffectSearchPaths", ".\\reshade-shaders\\Shaders\\**")
+
+    assert target.read_bytes() == b"\xef\xbb\xbf[GENERAL]\r\nEffectSearchPaths=.\\reshade-shaders\\Shaders\\**\r\n"
+
+
 def test_ini_set_exact_delete_key_when_empty_value(tmp_path: Path) -> None:
     target = tmp_path / "test.ini"
     target.write_text("[GENERAL]\nKey1=Val1\nKey2=Val2\n", encoding="utf-8")
@@ -217,7 +227,7 @@ def test_ini_set_exact_case_insensitive_section_update(tmp_path: Path) -> None:
 
 def test_ini_set_exact_error_handling(tmp_path: Path) -> None:
     target = tmp_path / "test.ini"
-    with patch("dlss5_enabler.core.ini.atomic_write_text", side_effect=OSError("Disk write error")):
+    with patch("dlss5_enabler.core.ini.atomic_write_bytes", side_effect=OSError("Disk write error")):
         assert not ini_set_exact(target, "GENERAL", "Key", "Val")
 
 
@@ -225,6 +235,6 @@ def test_ini_set_exact_read_failure_preserves_file(tmp_path: Path) -> None:
     target = tmp_path / "test.ini"
     original = "[GENERAL]\nExisting=Value\n"
     target.write_text(original, encoding="utf-8")
-    with patch.object(Path, "read_text", side_effect=OSError("Temporary read failure")):
+    with patch("dlss5_enabler.core.ini._load_ini_document", return_value=None):
         assert not ini_set_exact(target, "GENERAL", "NewKey", "NewValue")
     assert target.read_text(encoding="utf-8") == original
