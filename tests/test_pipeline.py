@@ -295,6 +295,83 @@ def test_native_dlss_preserves_game_dlss_runtime(tmp_path: Path) -> None:
     assert (tmp_path / "nvngx_dlssnr.dll").read_bytes() == b"NR"
 
 
+def test_32bit_host_uses_reshade_extraction_fallback(tmp_path: Path, mocker: MockerFixture) -> None:
+    setup = tmp_path / "ReShade_Setup_Addon.exe"
+    host_exe = tmp_path / "dlss5-feed-host64.exe"
+    addon = tmp_path / "renodx-dlss5.addon64"
+    nr_dll = tmp_path / "nvngx_dlssnr.dll"
+    sr_dll = tmp_path / "nvngx_dlss.dll"
+    extracted_dll = tmp_path / "ReShade64.dll"
+    for path in (setup, host_exe, addon, nr_dll, sr_dll, extracted_dll):
+        path.write_bytes(path.name.encode())
+    reshade = ReshadeBundle()
+    reshade.setup_exe_path = setup
+    feeder = FeederBundle()
+    feeder.host64_exe = host_exe
+    renodx = RenoDxBundle()
+    renodx.addon64_path = addon
+    ngx = NgxBundle()
+    ngx.nr_dll_path = nr_dll
+    ngx.sr_dll_path = sr_dll
+    ctx = PipelineContext(game_exe=tmp_path / "game.exe")
+    ctx.game_dir = tmp_path
+    ctx.reshade_dir = tmp_path
+    ctx.is_32bit = True
+    ctx.reshade_bundle = reshade
+    ctx.feeder_bundle = feeder
+    ctx.renodx_bundle = renodx
+    ctx.ngx_bundle = ngx
+    ctx.record = InstallRecord(game_exe=str(ctx.game_exe), game_dir=str(tmp_path))
+    mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
+    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", return_value=False)
+    mocker.patch(
+        "dlss5_enabler.operations.steps.extract_reshade_dlls_from_installer",
+        return_value={"reshade64.dll": extracted_dll},
+    )
+
+    assert StepInjectRenoDxAndNgx().execute(ctx)
+    host_dir = tmp_path / "host64"
+    assert (host_dir / "dxgi.dll").read_bytes() == b"ReShade64.dll"
+    host_ini = (host_dir / "ReShade.ini").read_text(encoding="utf-8")
+    assert "EffectSearchPaths=./reshade-shaders/Shaders/**" in host_ini
+    assert "TextureSearchPaths=./reshade-shaders/Textures/**" in host_ini
+    assert (host_dir / "renodx-dlss5.addon64").is_file()
+
+
+def test_32bit_host_missing_extraction_rolls_back(tmp_path: Path, mocker: MockerFixture) -> None:
+    setup = tmp_path / "ReShade_Setup_Addon.exe"
+    host_exe = tmp_path / "dlss5-feed-host64.exe"
+    addon = tmp_path / "renodx-dlss5.addon64"
+    nr_dll = tmp_path / "nvngx_dlssnr.dll"
+    sr_dll = tmp_path / "nvngx_dlss.dll"
+    for path in (setup, host_exe, addon, nr_dll, sr_dll):
+        path.write_bytes(path.name.encode())
+    reshade = ReshadeBundle()
+    reshade.setup_exe_path = setup
+    feeder = FeederBundle()
+    feeder.host64_exe = host_exe
+    renodx = RenoDxBundle()
+    renodx.addon64_path = addon
+    ngx = NgxBundle()
+    ngx.nr_dll_path = nr_dll
+    ngx.sr_dll_path = sr_dll
+    ctx = PipelineContext(game_exe=tmp_path / "game.exe")
+    ctx.game_dir = tmp_path
+    ctx.reshade_dir = tmp_path
+    ctx.is_32bit = True
+    ctx.reshade_bundle = reshade
+    ctx.feeder_bundle = feeder
+    ctx.renodx_bundle = renodx
+    ctx.ngx_bundle = ngx
+    ctx.record = InstallRecord(game_exe=str(ctx.game_exe), game_dir=str(tmp_path))
+    mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
+    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", return_value=False)
+    mocker.patch("dlss5_enabler.operations.steps.extract_reshade_dlls_from_installer", return_value={})
+
+    assert not PipelineRunner([StepInjectRenoDxAndNgx()]).run(ctx)
+    assert not (tmp_path / "host64").exists()
+
+
 def test_native_dlss_keeps_lumenite_without_feeder_definition(tmp_path: Path) -> None:
     staging = tmp_path / "stage"
     source = staging / "reshade-shaders" / "Shaders" / "lumenite_Kernel.fx"

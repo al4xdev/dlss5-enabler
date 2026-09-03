@@ -24,6 +24,7 @@ from dlss5_enabler.core.util import (
     get_cache_dir,
     get_permission_guidance,
     is_directory_writable,
+    remove_dir_if_empty,
     sha256_file,
     unblock_file,
 )
@@ -98,6 +99,27 @@ def _prepare_reshade_runtime_artifacts(ctx: PipelineContext) -> None:
     for directory in directories:
         for name in _RESHADER_RUNTIME_ARTIFACTS:
             _prepare_managed_path(ctx, directory / name)
+
+
+def _install_reshade_from_extraction(
+    ctx: PipelineContext,
+    setup_exe: Path,
+    target_dll: Path,
+    ini_path: Path,
+    bitness_key: str,
+) -> bool:
+    logger.info("ReShade unattended setup failed; attempting in-process extraction fallback...")
+    with tempfile.TemporaryDirectory(prefix="dlss5-enabler-reshade-", dir=get_cache_dir()) as stage_name:
+        dlls = extract_reshade_dlls_from_installer(setup_exe, Path(stage_name))
+        source_dll = dlls.get(bitness_key)
+        if source_dll is None:
+            return False
+        _place_file(ctx, source_dll, target_dll)
+    if ini_path.is_file():
+        return True
+    effect_ok = ini_set_exact(ini_path, "GENERAL", "EffectSearchPaths", "./reshade-shaders/Shaders/**")
+    texture_ok = ini_set_exact(ini_path, "GENERAL", "TextureSearchPaths", "./reshade-shaders/Textures/**")
+    return effect_ok and texture_ok
 
 
 def _relocate_redirected_d3d9_reshade(ctx: PipelineContext, game_ini: Path) -> bool:
@@ -379,23 +401,14 @@ class StepInstallReShade(PipelineStep):
 
             _prepare_reshade_runtime_artifacts(ctx)
             if not reshade_headless_install(ctx.reshade_bundle.setup_exe_path, ctx.game_exe, ctx.reshade_api):
-                logger.info("ReShade unattended setup failed; attempting in-process extraction fallback...")
-                with tempfile.TemporaryDirectory(prefix="dlss5-enabler-reshade-", dir=get_cache_dir()) as stage_name:
-                    stage_dir = Path(stage_name)
-                    dlls = extract_reshade_dlls_from_installer(ctx.reshade_bundle.setup_exe_path, stage_dir)
-                    bitness_key = "reshade32.dll" if ctx.is_32bit else "reshade64.dll"
-                    if bitness_key not in dlls:
-                        ctx.error_message = "ReShade unattended setup failed and direct extraction could not find DLL."
-                        return False
-                    _place_file(ctx, dlls[bitness_key], primary_dll)
-                if not game_ini.is_file():
-                    effect_ok = ini_set_exact(game_ini, "GENERAL", "EffectSearchPaths", "./reshade-shaders/Shaders/**")
-                    texture_ok = ini_set_exact(
-                        game_ini, "GENERAL", "TextureSearchPaths", "./reshade-shaders/Textures/**"
+                bitness_key = "reshade32.dll" if ctx.is_32bit else "reshade64.dll"
+                if not _install_reshade_from_extraction(
+                    ctx, ctx.reshade_bundle.setup_exe_path, primary_dll, game_ini, bitness_key
+                ):
+                    ctx.error_message = (
+                        "ReShade unattended setup failed and direct extraction could not create the runtime."
                     )
-                    if not effect_ok or not texture_ok:
-                        ctx.error_message = "Could not create the ReShade configuration."
-                        return False
+                    return False
 
             reshade_dll = ctx.game_dir / ctx.reshade_dll_name
             if not reshade_dll.is_file() and game_ini.is_file():
@@ -547,7 +560,13 @@ class StepInjectRenoDxAndNgx(PipelineStep):
                 installed = reshade_headless_install(
                     ctx.reshade_bundle.setup_exe_path, host_dir / "dlss5-feed-host64.exe", ctx.reshade_api
                 )
-                if not installed or not host_dxgi.is_file():
+                if (not installed or not host_dxgi.is_file()) and not _install_reshade_from_extraction(
+                    ctx,
+                    ctx.reshade_bundle.setup_exe_path,
+                    host_dxgi,
+                    host_ini,
+                    "reshade64.dll",
+                ):
                     ctx.error_message = f"Host ReShade setup did not create {ctx.reshade_dll_name}."
                     return False
                 managed_host_dll.size_bytes = host_dxgi.stat().st_size
@@ -568,6 +587,10 @@ class StepInjectRenoDxAndNgx(PipelineStep):
                 _place_file(ctx, ctx.ngx_bundle.sr_dll_path, ctx.reshade_dir / "nvngx_dlss.dll")
 
         return True
+
+    def rollback(self, ctx: PipelineContext) -> None:
+        if ctx.is_32bit:
+            remove_dir_if_empty(ctx.reshade_dir / "host64")
 
 
 class StepConfigureMotionVectors(PipelineStep):
