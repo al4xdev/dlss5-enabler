@@ -35,6 +35,11 @@ def _recorded_files(rec: InstallRecord) -> list[RecordedFile]:
     return [selected[key] for key in reversed(order)]
 
 
+def _feeder_host_runtime_artifacts(rec: InstallRecord) -> list[Path]:
+    host_dir = rec.effective_reshade_dir() / "host64"
+    return [host_dir / "dlss5-feed-host.log", *host_dir.glob("dlss5-feed-host64*.png")]
+
+
 def capture_install_snapshot(rec: InstallRecord) -> InstallSnapshot:
     root = Path(tempfile.mkdtemp(prefix="dlss5-enabler-install-snapshot-"))
     try:
@@ -45,6 +50,7 @@ def capture_install_snapshot(rec: InstallRecord) -> InstallSnapshot:
         paths.append(rec.record_path())
         reshade_dir = rec.effective_reshade_dir()
         paths.extend(reshade_dir / name for name in ["ReShade.log", "ReShade.ini.bak", "dxgi.log"])
+        paths.extend(_feeder_host_runtime_artifacts(rec))
         files: dict[str, Path] = {}
         for path in paths:
             resolved = str(path.resolve())
@@ -146,8 +152,9 @@ def _cleanup_empty_directories(rec: InstallRecord, game_dir: Path) -> None:
 def _finalize_uninstall(rec: InstallRecord, game_dir: Path, snapshot: InstallSnapshot, log: LogFn) -> bool:
     reshade_dir = rec.effective_reshade_dir()
     if rec.reshade_by_us:
-        for name in ["ReShade.log", "ReShade.ini.bak", "dxgi.log"]:
-            extra = reshade_dir / name
+        extras = [reshade_dir / name for name in ["ReShade.log", "ReShade.ini.bak", "dxgi.log"]]
+        extras.extend(_feeder_host_runtime_artifacts(rec))
+        for extra in extras:
             if extra.is_file():
                 try:
                     extra.unlink()

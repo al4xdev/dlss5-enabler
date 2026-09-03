@@ -888,6 +888,53 @@ def test_run_uninstall_full(tmp_path: Path, mocker: MockerFixture) -> None:
     assert not rec.record_path().exists()
 
 
+def test_run_uninstall_removes_feeder_host_runtime_artifacts(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_dir = tmp_path / "game"
+    host_dir = game_dir / "host64"
+    host_dir.mkdir(parents=True)
+    host_log = host_dir / "dlss5-feed-host.log"
+    screenshot = host_dir / "dlss5-feed-host64 2026-09-03 02-06-49_1.png"
+    host_log.write_bytes(b"HOST_LOG")
+    screenshot.write_bytes(b"SCREENSHOT")
+    rec = InstallRecord(
+        game_exe=str(game_dir / "game.exe"),
+        game_dir=str(game_dir),
+        reshade_dir=str(game_dir),
+        reshade_by_us=True,
+    )
+    rec.record_path().write_text(rec.model_dump_json(), encoding="utf-8")
+    mocker.patch("dlss5_enabler.operations.uninstall.index_remove", return_value=True)
+
+    assert run_uninstall(game_dir)
+    assert not host_log.exists()
+    assert not screenshot.exists()
+    assert not host_dir.exists()
+
+
+def test_failed_uninstall_restores_feeder_host_runtime_artifacts(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_dir = tmp_path / "game"
+    host_dir = game_dir / "host64"
+    host_dir.mkdir(parents=True)
+    host_log = host_dir / "dlss5-feed-host.log"
+    screenshot = host_dir / "dlss5-feed-host64 2026-09-03 02-06-49_1.png"
+    host_log.write_bytes(b"HOST_LOG")
+    screenshot.write_bytes(b"SCREENSHOT")
+    rec = InstallRecord(
+        game_exe=str(game_dir / "game.exe"),
+        game_dir=str(game_dir),
+        reshade_dir=str(game_dir),
+        reshade_by_us=True,
+    )
+    rec.record_path().write_text(rec.model_dump_json(), encoding="utf-8")
+    mocker.patch("dlss5_enabler.operations.uninstall.index_remove", return_value=False)
+    mocker.patch("dlss5_enabler.operations.uninstall.index_add", return_value=True)
+
+    assert not run_uninstall(game_dir)
+    assert host_log.read_bytes() == b"HOST_LOG"
+    assert screenshot.read_bytes() == b"SCREENSHOT"
+    assert rec.record_path().is_file()
+
+
 def test_run_uninstall_failure_restores_installed_state(tmp_path: Path, mocker: MockerFixture) -> None:
     game_dir = tmp_path / "game"
     game_dir.mkdir()
