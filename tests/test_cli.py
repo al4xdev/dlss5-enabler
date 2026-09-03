@@ -178,6 +178,46 @@ def test_cli_uninstall_command(tmp_path: Path, mocker: MockerFixture) -> None:
     assert res.exit_code == 0
 
 
+def test_cli_uninstall_resolves_unique_managed_executable_name(mocker: MockerFixture) -> None:
+    entry = IndexEntry(
+        game_exe="C:/games/Control/Control_DX12.exe",
+        game_dir="C:/games/Control",
+        timestamp="2026-09-03T00:00:00+00:00",
+    )
+    mocker.patch("dlss5_enabler.cli.index_load_active", return_value=[entry])
+    run_uninstall = mocker.patch("dlss5_enabler.cli.run_uninstall", return_value=True)
+
+    result = runner.invoke(app, ["uninstall", "control_dx12.EXE"])
+
+    assert result.exit_code == 0
+    run_uninstall.assert_called_once_with(Path(entry.game_exe))
+
+
+def test_cli_uninstall_rejects_ambiguous_executable_name(mocker: MockerFixture) -> None:
+    entries = [
+        IndexEntry(
+            game_exe="C:/games/First/game.exe",
+            game_dir="C:/games/First",
+            timestamp="2026-09-03T00:00:00+00:00",
+        ),
+        IndexEntry(
+            game_exe="D:/games/Second/GAME.EXE",
+            game_dir="D:/games/Second",
+            timestamp="2026-09-03T00:00:00+00:00",
+        ),
+    ]
+    mocker.patch("dlss5_enabler.cli.index_load_active", return_value=entries)
+    run_uninstall = mocker.patch("dlss5_enabler.cli.run_uninstall")
+
+    result = runner.invoke(app, ["uninstall", "game.exe"])
+
+    assert result.exit_code == 2
+    assert "More than one managed executable" in result.stdout
+    assert "C:/games/First/game.exe" in result.stdout
+    assert "D:/games/Second/GAME.EXE" in result.stdout
+    run_uninstall.assert_not_called()
+
+
 def test_cli_info_proton(tmp_path: Path, mocker: MockerFixture) -> None:
     game_exe = tmp_path / "game.exe"
     game_exe.write_bytes(b"MZ")

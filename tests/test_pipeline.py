@@ -908,9 +908,20 @@ def test_uninstall_restores_config_backup_byte_for_byte(tmp_path: Path, mocker: 
     assert config.read_bytes() == original
 
 
-def test_run_uninstall_no_record(tmp_path: Path) -> None:
+def test_run_uninstall_no_record_is_idempotent(tmp_path: Path) -> None:
     empty_dir = tmp_path / "empty_game"
     empty_dir.mkdir()
+    messages: list[str] = []
+
+    assert run_uninstall(empty_dir, log=messages.append)
+    assert any("already uninstalled" in message for message in messages)
+
+
+def test_run_uninstall_no_record_fails_when_index_cleanup_fails(tmp_path: Path, mocker: MockerFixture) -> None:
+    empty_dir = tmp_path / "empty_game"
+    empty_dir.mkdir()
+    mocker.patch("dlss5_enabler.operations.uninstall.index_remove", return_value=False)
+
     assert not run_uninstall(empty_dir)
 
 

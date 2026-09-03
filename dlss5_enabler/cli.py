@@ -107,6 +107,23 @@ def _path_size(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
 
+def _resolve_uninstall_target(target: str) -> Path:
+    candidate = Path(target).expanduser()
+    if candidate.exists():
+        return candidate.resolve()
+    if any(separator in target for separator in ("/", "\\", ":")):
+        raise ValueError(f"Target path does not exist: {target}")
+    matches = [entry for entry in index_load_active() if Path(entry.game_exe).name.casefold() == target.casefold()]
+    if not matches:
+        raise ValueError(f"No managed installation named '{target}' was found. Pass the full executable path instead.")
+    if len(matches) == 1:
+        return Path(matches[0].game_exe)
+    locations = "\n".join(
+        f"- {entry.game_exe}" for entry in sorted(matches, key=lambda entry: entry.game_exe.casefold())
+    )
+    raise ValueError(f"More than one managed executable is named '{target}':\n{locations}\nPass the full path.")
+
+
 @app.callback()
 def main_callback(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose debug logging")] = False,
@@ -231,16 +248,19 @@ def install_cmd(
 @app.command(name="uninstall")
 def uninstall_cmd(
     target: Annotated[
-        Path,
+        str,
         typer.Argument(
-            help="Path to the game executable (.exe) or game directory",
-            exists=True,
-            resolve_path=True,
+            help="Path to the game executable or directory, or a managed executable name",
         ),
     ],
 ) -> None:
-    console.print(f"[bold red]Uninstalling DLSS5 Enabler from:[/bold red] {target}")
-    success: bool = run_uninstall(target)
+    try:
+        resolved_target = _resolve_uninstall_target(target)
+    except ValueError as error:
+        console.print(f"[bold red]{error}[/bold red]")
+        raise typer.Exit(code=2) from error
+    console.print(f"[bold red]Uninstalling DLSS5 Enabler from:[/bold red] {resolved_target}")
+    success: bool = run_uninstall(resolved_target)
     if not success:
         console.print(
             f"[bold red]Uninstallation failed. Check log file: {get_log_dir() / 'dlss5-enabler.log'}[/bold red]"

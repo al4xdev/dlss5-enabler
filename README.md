@@ -184,7 +184,13 @@ dlss5-enabler update "/path/to/game.exe"
 dlss5-enabler uninstall "/path/to/game.exe"
 ```
 
-The target may be the game executable or its directory. Only files and settings recorded by DLSS5 Enabler are reverted.
+The target may be the game executable or its directory. For a uniquely managed game, its executable name also works:
+
+```console
+dlss5-enabler uninstall Control_DX12.exe
+```
+
+If multiple managed games have the same executable name, the command lists the matching paths and requires a full path. Only files and settings recorded by DLSS5 Enabler are reverted.
 
 ### List managed games
 

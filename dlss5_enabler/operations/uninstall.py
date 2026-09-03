@@ -180,11 +180,18 @@ def run_uninstall(game_dir_or_exe: Path | str, log: LogFn = print, lock_operatio
     return _run_uninstall_unlocked(game_dir, log)
 
 
+def _handle_missing_install_record(game_dir: Path, log: LogFn) -> bool:
+    if not index_remove(game_dir):
+        log(f"No install record found in {game_dir}, and the stale index entry could not be removed.")
+        return False
+    log(f"No DLSS5 Enabler install record found in {game_dir}; it is already uninstalled.")
+    return True
+
+
 def _run_uninstall_unlocked(game_dir: Path, log: LogFn) -> bool:
     rec = record_load(game_dir)
     if not rec:
-        log(f"No DLSS5 Enabler install record found in {game_dir} - nothing to uninstall.")
-        return False
+        return _handle_missing_install_record(game_dir, log)
     game_exe = Path(rec.game_exe)
     if not game_exe.is_absolute():
         game_exe = game_dir / game_exe
