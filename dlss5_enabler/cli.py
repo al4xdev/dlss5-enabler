@@ -108,6 +108,9 @@ def _path_size(path: Path) -> int:
 
 
 def _resolve_managed_target(target: str, *, executable_required: bool = False) -> Path:
+    target = target.strip()
+    if not target:
+        raise ValueError("A game executable path or managed executable name is required.")
     candidate = Path(target).expanduser()
     if candidate.exists():
         resolved = candidate.resolve()

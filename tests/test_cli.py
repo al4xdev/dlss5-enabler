@@ -200,7 +200,7 @@ def test_cli_uninstall_resolves_unique_managed_executable_name(mocker: MockerFix
     mocker.patch("dlss5_enabler.cli.index_load_active", return_value=[entry])
     run_uninstall = mocker.patch("dlss5_enabler.cli.run_uninstall", return_value=True)
 
-    result = runner.invoke(app, ["uninstall", "control_dx12.EXE"])
+    result = runner.invoke(app, ["uninstall", "  control_dx12.EXE  "])
 
     assert result.exit_code == 0
     run_uninstall.assert_called_once_with(Path(entry.game_exe))
