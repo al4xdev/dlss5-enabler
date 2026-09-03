@@ -50,7 +50,7 @@ dlss5_enabler/
 └── cli.py                Typer interface
 ```
 
-Tests live in `tests/`, workflows in `.github/workflows/`, and executable implementation plans in `.plan/`.
+Tests live in `tests/` and workflows in `.github/workflows/`.
 
 ## 3. Python tooling and environment
 
@@ -66,7 +66,7 @@ Tests live in `tests/`, workflows in `.github/workflows/`, and executable implem
 
 ### 4.1 Zero comments and zero docstrings in the package
 
-Python files under `dlss5_enabler/` must not contain inline comments or internal docstrings. Documentation belongs in `README.md`, this file, or `.plan/`.
+Python files under `dlss5_enabler/` must not contain inline comments or internal docstrings. Documentation belongs in `README.md` or this file.
 
 This rule does not prohibit user-facing strings, error messages, metadata, or Markdown documentation.
 
@@ -143,6 +143,18 @@ New mirrors must implement `DownloadSourceAdapter` and return the same provider-
 - ReShade Addon comes from the official website rather than GitHub, but it uses the same HTTP bounds and guarantees.
 - ReShade headers and LumeniteFX must resolve to immutable commits.
 - dgVoodoo2 requires the real release asset and the correct x86/x64 subdirectory. Do not assume versioned filenames.
+
+### 6.1 Component integration playbook
+
+Apply this playbook whenever adding or replacing a managed rendering engine, translation layer, hook, add-on, shader provider, DLSS runtime, or other game-side binary component.
+
+1. Establish the component contract before coding: supported APIs and architectures, upstream ownership, required companion files, configuration, platform-specific behavior, and interactions with existing managed components.
+2. Resolve upstream artifacts through the provider and cache contracts. Validate the real release layout, select the correct architecture, and add a pinned fallback when the component is a required upstream.
+3. Map every mutation before installation: placed binaries, edited files and INI keys, registry or Wine changes, created directories, generated logs, screenshots, caches, shader outputs, and helper-process artifacts. Classify each as pre-existing user state, installer-owned state, or runtime-generated state.
+4. Record or snapshot every installer-owned mutation so rollback and uninstall restore pre-existing bytes exactly. Runtime-generated artifacts must be explicitly included in the uninstall snapshot and cleanup only when their ownership is unambiguous.
+5. Add isolated tests for discovery, architecture selection, safe placement, install/uninstall round trip, rollback after a later failure, and generated-artifact cleanup with restoration if finalization fails.
+6. Perform an opt-in real-game smoke test when practical: inventory the target directory before installation, inspect it again after the game has run, compare the new files with the mutation map, then uninstall with the game closed and verify that only declared user-owned files remain.
+7. If a component conflicts with native game functionality, detect the native capability early and select the least invasive compatible path. Do not install a generic hook merely because it is available.
 
 ## 7. Test strategy
 
@@ -221,10 +233,7 @@ A network failure while reading status does not imply a failed deployment. Do no
 - Windows Docker is not required for fetch, cache, archive, or synthetic pipeline tests. Prefer small fixtures to conserve memory.
 - If subagents are explicitly used, do not poll them in a loop and terminate any that remain active.
 
-## 11. Plans and documentation
+## 11. Documentation
 
-- New plans belong in `.plan/`.
-- Read a complete plan before implementing it.
-- Treat plans as specifications and change them only when the user asks.
-- After implementing a plan, verify every acceptance criterion against the code and tests.
-- README is user documentation. AGENTS.md is operational documentation. Temporary investigation details belong in neither.
+- README is user documentation. AGENTS.md is operational documentation for coding agents.
+- Keep temporary investigation details out of tracked documentation.

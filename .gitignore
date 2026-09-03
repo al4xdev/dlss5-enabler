@@ -84,6 +84,7 @@ Icon?
 *.sublime-project
 
 # DLSS5 Enabler runtime & local install artifacts
+.plan/
 *.dlss5-enabler.bak
 *.dlss5-enabler.tmp
 dlss5-enabler.install.json
