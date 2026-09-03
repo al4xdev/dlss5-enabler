@@ -117,6 +117,19 @@ def test_cli_install_command_success(tmp_path: Path, mocker: MockerFixture) -> N
     assert "DLSS 5 Feed" in res.stdout
 
 
+def test_cli_install_resolves_unique_managed_executable_name(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    entry = IndexEntry(game_exe=str(game_exe), game_dir=str(tmp_path), timestamp="2026-09-03T00:00:00+00:00")
+    mocker.patch("dlss5_enabler.cli.index_load_active", return_value=[entry])
+    install = mocker.patch("dlss5_enabler.cli.run_install", return_value=True)
+
+    result = runner.invoke(app, ["install", "GAME.EXE"])
+
+    assert result.exit_code == 0
+    assert install.call_args.kwargs["game_exe_path"] == game_exe
+
+
 def test_cli_install_shows_native_dlss_activation_guide(tmp_path: Path, mocker: MockerFixture) -> None:
     game_exe = tmp_path / "game.exe"
     game_exe.write_bytes(b"MZ")
@@ -216,6 +229,22 @@ def test_cli_uninstall_rejects_ambiguous_executable_name(mocker: MockerFixture) 
     assert "C:/games/First/game.exe" in result.stdout
     assert "D:/games/Second/GAME.EXE" in result.stdout
     run_uninstall.assert_not_called()
+
+
+def test_cli_info_resolves_unique_managed_executable_name(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    entry = IndexEntry(game_exe=str(game_exe), game_dir=str(tmp_path), timestamp="2026-09-03T00:00:00+00:00")
+    mocker.patch("dlss5_enabler.cli.index_load_active", return_value=[entry])
+    detect_arch = mocker.patch("dlss5_enabler.cli.detect_pe_arch", return_value=PeArch.X64)
+    mocker.patch("dlss5_enabler.cli.file_is_writable", return_value=True)
+    mocker.patch("dlss5_enabler.cli.record_load", return_value=None)
+
+    result = runner.invoke(app, ["info", "GAME.EXE"])
+
+    assert result.exit_code == 0
+    assert "game.exe" in result.stdout
+    assert detect_arch.call_args.args[0] == game_exe
 
 
 def test_cli_info_proton(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -388,6 +417,22 @@ def test_cli_update_command_replays_managed_install(tmp_path: Path, mocker: Mock
     assert "Activate ReShade effects" in result.stdout
     assert update.call_args.kwargs["force_download"] is True
     assert update.call_args.kwargs["verbose"] is True
+
+
+def test_cli_update_resolves_unique_managed_executable_name(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    entry = IndexEntry(game_exe=str(game_exe), game_dir=str(tmp_path), timestamp="2026-09-03T00:00:00+00:00")
+    mocker.patch("dlss5_enabler.cli.index_load_active", return_value=[entry])
+    update = mocker.patch(
+        "dlss5_enabler.cli.run_update",
+        return_value=GameUpdateResult(GameUpdateStatus.ALREADY_CURRENT, "Already current."),
+    )
+
+    result = runner.invoke(app, ["update", "GAME.EXE"])
+
+    assert result.exit_code == 0
+    assert update.call_args.args[0] == game_exe
 
 
 def test_cli_update_failure_has_nonzero_exit(tmp_path: Path, mocker: MockerFixture) -> None:

@@ -151,6 +151,8 @@ dlss5-enabler info "/path/to/game.exe"
 
 Reports architecture, imported graphics APIs, write access, installed and current tool versions, saved options, component versions, and a detected Proton prefix.
 
+For a game already managed by DLSS5 Enabler, `info`, `install`, `update`, and `uninstall` also accept its executable name, for example `dlss5-enabler info Control_DX12.exe`. If more than one managed game has that name, the CLI lists the matching paths and requires the full path.
+
 ### Install
 
 ```console
@@ -174,6 +176,7 @@ Options:
 
 ```console
 dlss5-enabler update "/path/to/game.exe"
+dlss5-enabler update Control_DX12.exe
 ```
 
 `update` reads the installation metadata beside the game, then transactionally reapplies the same LumeniteFX, D3D9, OpenGL, and Vulkan choices with the components managed by the current CLI. Use `--reinstall` to reapply an already-current installation or `--force-download` to bypass component caches. A game installed by a newer CLI is never downgraded.

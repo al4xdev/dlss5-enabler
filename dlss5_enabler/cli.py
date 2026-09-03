@@ -107,21 +107,36 @@ def _path_size(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
 
-def _resolve_uninstall_target(target: str) -> Path:
+def _resolve_managed_target(target: str, *, executable_required: bool = False) -> Path:
     candidate = Path(target).expanduser()
     if candidate.exists():
-        return candidate.resolve()
-    if any(separator in target for separator in ("/", "\\", ":")):
+        resolved = candidate.resolve()
+    elif any(separator in target for separator in ("/", "\\", ":")):
         raise ValueError(f"Target path does not exist: {target}")
-    matches = [entry for entry in index_load_active() if Path(entry.game_exe).name.casefold() == target.casefold()]
-    if not matches:
-        raise ValueError(f"No managed installation named '{target}' was found. Pass the full executable path instead.")
-    if len(matches) == 1:
-        return Path(matches[0].game_exe)
-    locations = "\n".join(
-        f"- {entry.game_exe}" for entry in sorted(matches, key=lambda entry: entry.game_exe.casefold())
-    )
-    raise ValueError(f"More than one managed executable is named '{target}':\n{locations}\nPass the full path.")
+    else:
+        matches = [entry for entry in index_load_active() if Path(entry.game_exe).name.casefold() == target.casefold()]
+        if not matches:
+            raise ValueError(
+                f"No managed installation named '{target}' was found. Pass the full executable path instead."
+            )
+        if len(matches) == 1:
+            resolved = Path(matches[0].game_exe)
+        else:
+            locations = "\n".join(
+                f"- {entry.game_exe}" for entry in sorted(matches, key=lambda entry: entry.game_exe.casefold())
+            )
+            raise ValueError(f"More than one managed executable is named '{target}':\n{locations}\nPass the full path.")
+    if executable_required and not resolved.is_file():
+        raise ValueError(f"Target is not a game executable: {resolved}")
+    return resolved
+
+
+def _resolve_target_or_exit(target: str, *, executable_required: bool = False) -> Path:
+    try:
+        return _resolve_managed_target(target, executable_required=executable_required)
+    except ValueError as error:
+        console.print(f"[bold red]{error}[/bold red]")
+        raise typer.Exit(code=2) from error
 
 
 @app.callback()
@@ -140,14 +155,10 @@ def check_cmd() -> None:
 
 @app.command(name="install")
 def install_cmd(
-    exe: Annotated[
-        Path,
+    target: Annotated[
+        str,
         typer.Argument(
-            help="Path to the game executable (.exe)",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            resolve_path=True,
+            help="Path to the game executable (.exe), or its managed executable name",
         ),
     ],
     lumenite: Annotated[
@@ -196,6 +207,7 @@ def install_cmd(
     ] = False,
 ) -> None:
     setup_logger(verbose=verbose)
+    exe = _resolve_target_or_exit(target, executable_required=True)
     _check_cli_update()
     if d3d9 and opengl:
         console.print("[bold red]--d3d9 and --opengl cannot be used together.[/bold red]")
@@ -254,11 +266,7 @@ def uninstall_cmd(
         ),
     ],
 ) -> None:
-    try:
-        resolved_target = _resolve_uninstall_target(target)
-    except ValueError as error:
-        console.print(f"[bold red]{error}[/bold red]")
-        raise typer.Exit(code=2) from error
+    resolved_target = _resolve_target_or_exit(target)
     console.print(f"[bold red]Uninstalling DLSS5 Enabler from:[/bold red] {resolved_target}")
     success: bool = run_uninstall(resolved_target)
     if not success:
@@ -271,11 +279,9 @@ def uninstall_cmd(
 @app.command(name="update")
 def update_cmd(
     target: Annotated[
-        Path,
+        str,
         typer.Argument(
-            help="Path to a managed game executable (.exe) or game directory",
-            exists=True,
-            resolve_path=True,
+            help="Path to a managed game executable or directory, or its executable name",
         ),
     ],
     reinstall: Annotated[
@@ -292,9 +298,10 @@ def update_cmd(
     ] = False,
 ) -> None:
     setup_logger(verbose=verbose)
+    resolved_target = _resolve_target_or_exit(target)
     _check_cli_update()
     result = run_update(
-        target,
+        resolved_target,
         reinstall=reinstall,
         force_download=force_download,
         verbose=verbose,
@@ -305,7 +312,7 @@ def update_cmd(
     if not result.success:
         raise typer.Exit(code=1)
     if result.status in {GameUpdateStatus.UPDATED, GameUpdateStatus.REINSTALLED}:
-        record = record_load(Path(target).parent if Path(target).is_file() else Path(target))
+        record = record_load(resolved_target.parent if resolved_target.is_file() else resolved_target)
         _show_reshade_activation_guide(
             result.options.lumenite if result.options is not None else True,
             record.native_dlss_detected if record is not None else False,
@@ -344,17 +351,14 @@ def list_cmd() -> None:
 
 @app.command(name="info")
 def info_cmd(
-    exe: Annotated[
-        Path,
+    target: Annotated[
+        str,
         typer.Argument(
-            help="Path to game executable (.exe)",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            resolve_path=True,
+            help="Path to game executable (.exe), or its managed executable name",
         ),
     ],
 ) -> None:
+    exe = _resolve_target_or_exit(target, executable_required=True)
     _check_cli_update()
     arch = detect_pe_arch(exe)
     writable = file_is_writable(exe)
