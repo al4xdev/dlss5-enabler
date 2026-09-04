@@ -7,7 +7,7 @@ Transactional command-line installer for managing the DLSS5-Feeder Neural Render
 [![Typing](https://img.shields.io/badge/typing-mypy%20%2B%20pyright%20strict-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
-DLSS5 Enabler automates a setup that would otherwise require manually coordinating several upstream projects, selecting the correct 32-bit or 64-bit binaries, configuring ReShade, editing Wine overrides, and preserving enough state to undo every change later. The CLI runs on Windows, Linux, and SteamOS, while the installation target is always a Windows PE executable.
+DLSS5 Enabler automates a setup that would otherwise require manually coordinating several upstream projects, selecting the correct 32-bit or 64-bit binaries, configuring ReShade, editing Wine overrides, and preserving enough state to undo every change later. The CLI runs on Windows and experimental Linux / SteamOS, while the installation target is always a Windows PE executable.
 
 It combines:
 
@@ -37,7 +37,7 @@ Although the user-facing job is game mod orchestration, the project exercises br
 - safe ZIP and 7z extraction across Windows and POSIX path conventions;
 - transactional filesystem and Wine registry changes with rollback and byte-for-byte restoration;
 - typed metadata migrations that preserve installation choices across CLI upgrades;
-- cross-platform packaging and automated validation on Windows, Linux, and macOS.
+- cross-platform packaging and automated validation on Windows, experimental Linux, and macOS.
 
 macOS is a CI portability target for the Python, archive, cache, and packaging layers. It is not presented as a DLSS runtime or game-installation target.
 
@@ -77,7 +77,7 @@ These are implemented installer paths, not claims of universal compatibility wit
 | Environment | Role |
 | --- | --- |
 | Windows | Runs the CLI and manages a native Windows game executable |
-| Linux / SteamOS | Runs the CLI and manages a Windows game executable through Wine or Proton |
+| Experimental Linux / SteamOS | Runs the CLI and manages a Windows game executable through Wine or Proton |
 | macOS | Runs portability, packaging, and synthetic-artifact checks in CI only |
 
 The installation target must be a Windows PE executable. Native Linux ELF binaries are inspected for diagnostics but are rejected as installation targets, and the project does not claim a native macOS DLSS runtime.
@@ -133,7 +133,7 @@ On Windows, PowerShell and `cmd.exe` paths work normally:
 dlss5-enabler install "C:\Games\Example\game.exe"
 ```
 
-On SteamOS or Linux, point to the Windows executable inside the Steam library:
+On SteamOS or experimental Linux, point to the Windows executable inside the Steam library:
 
 ```console
 dlss5-enabler install "/home/deck/.local/share/Steam/steamapps/common/Example/game.exe"
@@ -251,7 +251,7 @@ The main warning codes distinguish discovery, missing or ambiguous assets, timeo
 | Platform | Data and cache location |
 | --- | --- |
 | Windows | `%LOCALAPPDATA%\DLSS5 Enabler` |
-| Linux / SteamOS | XDG data, cache, config, and state directories under `dlss5-enabler` |
+| Experimental Linux / SteamOS | XDG data, cache, config, and state directories under `dlss5-enabler` |
 | Per game | `dlss5-enabler.install.json` beside the game executable |
 
 The log file is named `dlss5-enabler.log`.
@@ -263,7 +263,7 @@ dlss5_enabler/
 ├── core/          Binary inspection, exact-case INI handling, records, atomic I/O
 ├── network/       HTTPS downloads, release discovery, cache validation
 ├── operations/    Transactional install, update, and uninstall pipelines
-├── platform/      Windows, Linux, Wine, Proton, and Steam discovery adapters
+├── platform/      Windows, experimental Linux, Wine, Proton, and Steam discovery adapters
 ├── check.py       Unified quality runner
 └── cli.py         Typer command-line interface
 ```
