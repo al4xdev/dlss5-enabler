@@ -51,6 +51,16 @@ def test_embedded_manifest_loads_every_component() -> None:
     )
 
 
+def test_reshade_header_fallback_pins_match_the_verified_snapshot() -> None:
+    headers = load_upstream_manifest().components["reshade_headers"].stable_artifacts
+
+    assert {artifact.name: artifact.sha256 for artifact in headers} == {
+        "ReShade.fxh": "6dabfbbaf968c3871905d2ea17f96572ff7b1cec01310b5d0e5252b66b30174f",
+        "ReShadeUI.fxh": "78adf672df47460297eb9fe6dd238d2aafa24510b52b84feb1a745dff70eb901",
+        "DrawText.fxh": "b79cc4dfb3e98bcf4c06193d00ea7631d74f467f73a4deeeee13e71336d3e680",
+    }
+
+
 def test_manifest_resource_is_available_outside_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
 

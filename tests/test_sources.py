@@ -1,3 +1,4 @@
+import hashlib
 import json
 import zipfile
 from io import BytesIO
@@ -7,6 +8,7 @@ from typing import Any
 import pytest
 from pytest_mock import MockerFixture
 
+from dlss5_enabler.network.manifest import load_upstream_manifest
 from dlss5_enabler.network.resolver import ArtifactResolutionError, ResolutionWarningCode, UpstreamResolutionError
 from dlss5_enabler.network.sources import (
     fetch_dgvoodoo,
@@ -372,6 +374,48 @@ def test_fetch_reshade_headers(tmp_path: Path, mocker: MockerFixture) -> None:
     assert [item.args[0] for item in metadata.call_args_list] == [
         "https://api.github.com/repos/crosire/reshade-shaders/commits/slim",
     ]
+
+
+def test_fetch_reshade_headers_uses_stable_fallback_after_discovery_timeout(
+    tmp_path: Path, mocker: MockerFixture
+) -> None:
+    payloads = {
+        "ReShade.fxh": b"RESHADEx",
+        "ReShadeUI.fxh": b"RESHADExUI",
+        "DrawText.fxh": b"RESHADExTEXT",
+    }
+    original = load_upstream_manifest().components["reshade_headers"]
+    stable_artifacts = tuple(
+        artifact.model_copy(update={"sha256": hashlib.sha256(payloads[artifact.name]).hexdigest()})
+        for artifact in original.stable_artifacts
+    )
+    policy = original.model_copy(update={"stable_artifacts": stable_artifacts})
+    mocker.patch("dlss5_enabler.network.sources.get_cache_dir", return_value=tmp_path)
+    mocker.patch("dlss5_enabler.network.sources._policy", return_value=policy)
+    metadata = mocker.patch("dlss5_enabler.network.sources.http_get_json", side_effect=RuntimeError("timed out"))
+
+    def mock_download(url: str, dest: Path | str, progress_fn: Any = None) -> Path:
+        path = Path(dest)
+        path.write_bytes(payloads[path.name])
+        return path
+
+    download = mocker.patch("dlss5_enabler.network.sources.http_download_file", side_effect=mock_download)
+
+    bundle = fetch_reshade_headers(log=lambda _message: None)
+
+    assert bundle.fxh_path is not None and bundle.fxh_path.read_bytes() == payloads["ReShade.fxh"]
+    assert bundle.ui_fxh_path is not None and bundle.ui_fxh_path.read_bytes() == payloads["ReShadeUI.fxh"]
+    assert bundle.drawtext_path is not None and bundle.drawtext_path.read_bytes() == payloads["DrawText.fxh"]
+    assert download.call_count == 3
+    metadata.assert_called_once_with("https://api.github.com/repos/crosire/reshade-shaders/commits/slim")
+    assert tuple(warning.code for warning in bundle.warnings) == (
+        ResolutionWarningCode.DISCOVERY_FAILED,
+        ResolutionWarningCode.STABLE_FALLBACK_USED,
+        ResolutionWarningCode.DISCOVERY_FAILED,
+        ResolutionWarningCode.STABLE_FALLBACK_USED,
+        ResolutionWarningCode.DISCOVERY_FAILED,
+        ResolutionWarningCode.STABLE_FALLBACK_USED,
+    )
 
 
 def test_fetch_lumenite(tmp_path: Path, mocker: MockerFixture) -> None:

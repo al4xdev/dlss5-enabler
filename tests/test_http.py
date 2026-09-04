@@ -8,7 +8,9 @@ from pytest_mock import MockerFixture
 
 from dlss5_enabler.network.http import (
     DOWNLOAD_DEADLINE_SECONDS,
+    METADATA_DEADLINE_SECONDS,
     _curl_download,
+    _curl_get_text,
     create_client,
     http_download_file,
     http_get_json,
@@ -69,10 +71,28 @@ def test_http_get_text_retries_exhausted(mocker: MockerFixture) -> None:
     mock_client.__exit__.return_value = None
 
     mocker.patch("dlss5_enabler.network.http.create_client", return_value=mock_client)
+    mocker.patch("dlss5_enabler.network.http._curl_get_text", return_value=None)
     mocker.patch("time.sleep", return_value=None)
 
     with pytest.raises(RuntimeError, match="HTTP GET failed"):
         http_get_text("http://example.com", retries=2)
+
+
+def test_http_get_text_uses_curl_after_transient_failures(mocker: MockerFixture) -> None:
+    mock_client = mocker.MagicMock(spec=httpx.Client)
+    mock_client.get.side_effect = httpx.ReadTimeout("Timeout")
+    mock_client.__enter__.return_value = mock_client
+    mock_client.__exit__.return_value = None
+    mocker.patch("dlss5_enabler.network.http.create_client", return_value=mock_client)
+    mocker.patch("time.sleep", return_value=None)
+    curl = mocker.patch("dlss5_enabler.network.http._curl_get_text", return_value="CURL_RESPONSE")
+
+    result = http_get_text("https://api.example.com/data", retries=2)
+
+    assert result == "CURL_RESPONSE"
+    curl.assert_called_once()
+    assert curl.call_args.args[0] == "https://api.example.com/data"
+    assert curl.call_args.args[2] <= METADATA_DEADLINE_SECONDS
 
 
 def test_http_get_text_does_not_retry_not_found(mocker: MockerFixture) -> None:
@@ -82,12 +102,14 @@ def test_http_get_text_does_not_retry_not_found(mocker: MockerFixture) -> None:
     mock_client.__enter__.return_value = mock_client
     mock_client.__exit__.return_value = None
     mocker.patch("dlss5_enabler.network.http.create_client", return_value=mock_client)
+    curl = mocker.patch("dlss5_enabler.network.http._curl_get_text")
     sleep = mocker.patch("time.sleep")
 
     with pytest.raises(RuntimeError, match="404"):
         http_get_text("https://example.com/missing")
 
     assert mock_client.get.call_count == 1
+    curl.assert_not_called()
     sleep.assert_not_called()
 
 
@@ -164,6 +186,22 @@ def test_curl_download_exception(tmp_path: Path, mocker: MockerFixture) -> None:
     dest = tmp_path / "file.zip"
     mocker.patch("subprocess.run", side_effect=Exception("Curl not found"))
     assert not _curl_download("http://example.com/file.zip", dest)
+
+
+def test_curl_get_text_success(mocker: MockerFixture) -> None:
+    result = mocker.MagicMock(spec=subprocess.CompletedProcess)
+    result.returncode = 0
+    result.stdout = "CURL_RESPONSE"
+    mock_run = mocker.patch("subprocess.run", return_value=result)
+
+    value = _curl_get_text("https://api.example.com/data", {"X-Test": "123"}, timeout_seconds=12.5)
+
+    assert value == "CURL_RESPONSE"
+    command = mock_run.call_args.args[0]
+    assert "-k" not in command
+    assert "--fail" in command
+    assert command[command.index("-m") + 1] == "13"
+    assert command[command.index("-H") + 1] == "X-Test: 123"
 
 
 def test_http_download_file_stream_success(tmp_path: Path, mocker: MockerFixture) -> None:

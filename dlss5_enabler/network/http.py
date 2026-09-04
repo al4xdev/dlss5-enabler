@@ -16,6 +16,7 @@ from dlss5_enabler.platform import get_platform_adapter
 
 CONNECT_TIMEOUT_SECONDS = 15.0
 IO_TIMEOUT_SECONDS = 30.0
+METADATA_DEADLINE_SECONDS = 60.0
 DOWNLOAD_DEADLINE_SECONDS = 180.0
 DEFAULT_TIMEOUT: httpx.Timeout = httpx.Timeout(
     IO_TIMEOUT_SECONDS,
@@ -63,16 +64,52 @@ def _is_retryable(error: Exception) -> bool:
     )
 
 
+def _curl_get_text(url: str, headers: dict[str, str], timeout_seconds: float) -> str | None:
+    try:
+        timeout = max(1, ceil(timeout_seconds))
+        connect_timeout = max(1, min(ceil(CONNECT_TIMEOUT_SECONDS), timeout))
+        curl_cmd = get_platform_adapter().get_curl_command()
+        header_args = [argument for name, value in headers.items() for argument in ("-H", f"{name}: {value}")]
+        cmd = [
+            *curl_cmd,
+            "-L",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--retry",
+            "2",
+            "--retry-delay",
+            "2",
+            "--connect-timeout",
+            str(connect_timeout),
+            "-m",
+            str(timeout),
+            *header_args,
+            url,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5, check=False)
+        return result.stdout if result.returncode == 0 and result.stdout else None
+    except Exception:
+        return None
+
+
 def http_get_text(url: str, retries: int = 3, headers: dict[str, str] | None = None) -> str:
+    if retries < 1:
+        raise ValueError("HTTP retries must be at least 1")
     req_headers = DEFAULT_HEADERS.copy()
     if headers:
         req_headers.update(headers)
 
+    deadline = time.monotonic() + METADATA_DEADLINE_SECONDS
     last_err: Exception | None = None
     for attempt in range(1, retries + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            last_err = TimeoutError(f"HTTP request exceeded {METADATA_DEADLINE_SECONDS:.0f} seconds")
+            break
         try:
             with create_client() as client:
-                res = client.get(url, headers=req_headers)
+                res = client.get(url, headers=req_headers, timeout=remaining)
                 res.raise_for_status()
                 return res.text
         except Exception as e:
@@ -80,7 +117,15 @@ def http_get_text(url: str, retries: int = 3, headers: dict[str, str] | None = N
             if not _is_retryable(e):
                 break
             if attempt < retries:
-                time.sleep(1.5 * attempt)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(1.5 * attempt, remaining))
+    remaining = deadline - time.monotonic()
+    if last_err is not None and _is_retryable(last_err) and remaining > 0:
+        fallback = _curl_get_text(url, req_headers, remaining)
+        if fallback is not None:
+            return fallback
     raise RuntimeError(f"HTTP GET failed for {url}: {last_err}")
 
 

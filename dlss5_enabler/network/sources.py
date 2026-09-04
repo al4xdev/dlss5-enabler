@@ -470,11 +470,18 @@ def fetch_reshade_headers(log: LogFn, progress: ProgressFn | None = None, force:
     if repository is None or branch is None or not relative_paths:
         raise RuntimeError("ReShade headers policy is incomplete")
     snapshot: RepositorySnapshot | None = None
+    snapshot_error: Exception | None = None
 
     def latest(relative_path: str) -> tuple[ArtifactCandidate, ...]:
-        nonlocal snapshot
+        nonlocal snapshot, snapshot_error
         if snapshot is None:
-            snapshot = adapter.repository_snapshot(repository, branch)
+            if snapshot_error is not None:
+                raise snapshot_error
+            try:
+                snapshot = adapter.repository_snapshot(repository, branch)
+            except Exception as error:
+                snapshot_error = error
+                raise
         return _repository_file_candidates(adapter, repository, snapshot.revision, relative_path)
 
     results: dict[str, ResolvedArtifact] = {}
