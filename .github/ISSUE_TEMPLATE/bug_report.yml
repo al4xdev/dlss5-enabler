@@ -1,0 +1,142 @@
+name: Bug report
+description: Report an installation, removal, compatibility, or runtime problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve DLSS5 Enabler. Please complete the fields below so the problem can be reproduced and routed to the correct project.
+
+        Remove personal information from logs before attaching them. Do not include access tokens, credentials, or private download URLs.
+
+  - type: input
+    id: version
+    attributes:
+      label: DLSS5 Enabler version
+      description: Run `dlss5-enabler --version` and paste the result.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: game
+    attributes:
+      label: Game and executable
+      description: Include the game name and the executable selected during installation.
+      placeholder: "Detroit: Become Human — DetroitBecomeHuman.exe"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - SteamOS
+        - Other Linux distribution
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: launch-environment
+    attributes:
+      label: Launch environment
+      options:
+        - Native Windows
+        - Steam Proton
+        - Wine
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: graphics-api
+    attributes:
+      label: Graphics API
+      description: Select the API used by the game when the problem occurs.
+      options:
+        - DirectX 12
+        - DirectX 11
+        - DirectX 10
+        - DirectX 9
+        - Vulkan
+        - OpenGL
+        - Unknown
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      placeholder: "NVIDIA GeForce RTX 4070 — driver 580.88"
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Installation command and options
+      description: Paste the complete command used to install or update the stack.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the problem, what you expected, and the exact steps needed to reproduce it.
+      placeholder: |
+        Expected:
+
+        Actual:
+
+        Steps to reproduce:
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: installer-log
+    attributes:
+      label: Installer log
+      description: |
+        Drag the log file into this field. On Windows it is `%LOCALAPPDATA%\DLSS5 Enabler\logs\dlss5-enabler.log`. On Linux and SteamOS it is `$XDG_STATE_HOME/dlss5-enabler/logs/dlss5-enabler.log`, normally `~/.local/state/dlss5-enabler/logs/dlss5-enabler.log`.
+      placeholder: Drag dlss5-enabler.log here, or explain why it is unavailable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: runtime-logs
+    attributes:
+      label: Game and component logs
+      description: Attach any `ReShade.log`, `dxgi.log`, `dlss5-feed.log`, or `dlss5-feed-host.log` created in the game directory or its ReShade directory. Explain if none were created.
+      placeholder: Drag the relevant files here, or state that no runtime log was created.
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add screenshots, configuration details, or other information that may help reproduce the problem.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched the existing open and closed issues for the same problem.
+          required: true
+        - label: I reproduced the problem with the latest available DLSS5 Enabler version.
+          required: true
+        - label: I removed personal information and secrets from the attached logs.
+          required: true
