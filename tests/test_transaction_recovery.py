@@ -9,7 +9,16 @@ from pytest_mock import MockerFixture
 
 from dlss5_enabler.core.fileio import atomic_copy_file, resource_lock
 from dlss5_enabler.core.mutations import prepare_managed_path, prepare_runtime_artifacts, track_created_directories
-from dlss5_enabler.core.record import InstallRecord, RecordedFile, index_add, index_load, record_save
+from dlss5_enabler.core.record import (
+    CURRENT_RECORD_SCHEMA_VERSION,
+    InstallRecord,
+    OptiScalerStrategyOptions,
+    RecordedFile,
+    RuntimeArtifacts,
+    index_add,
+    index_load,
+    record_save,
+)
 from dlss5_enabler.operations.reshade import (
     ensure_mv_provider_def,
     extract_reshade_dlls_from_installer,
@@ -22,6 +31,7 @@ from dlss5_enabler.operations.uninstall import (
     revert_record_mutations,
     run_uninstall,
 )
+from dlss5_enabler.schemas.strategy import InstallStrategy
 
 
 def _record(game_dir: Path) -> InstallRecord:
@@ -419,3 +429,198 @@ def test_managed_ini_updates_hold_one_destination_lock_without_reacquiring(
     assert len(rec.files) == 1
     assert revert_record_mutations(rec)
     assert ini.read_bytes() == original
+
+
+def _optiscaler_record(game_dir: Path) -> InstallRecord:
+    return InstallRecord(
+        schema_version=CURRENT_RECORD_SCHEMA_VERSION,
+        game_exe=(game_dir / "game.exe").as_posix(),
+        game_dir=game_dir.as_posix(),
+        strategy=InstallStrategy.OPTISCALER,
+        strategy_options=OptiScalerStrategyOptions(proxy_name="dxgi.dll", source_revision="fixture-revision"),
+    )
+
+
+@pytest.mark.parametrize("finalization_fails", [False, True])
+def test_optiscaler_proxy_ini_zip_files_and_runtime_restore_transactionally(
+    tmp_path: Path, mocker: MockerFixture, finalization_fails: bool
+) -> None:
+    rec = _optiscaler_record(tmp_path)
+    originals = {
+        "dxgi.dll": b"Existing user proxy",
+        "OptiScaler.ini": b"\xef\xbb\xbf; custom\r\n[DlssNr]\r\n Passes = 2 \r\n",
+        "OptiScaler.log": b"Previous runtime log\r\n",
+        "Licenses/OptiScaler/LICENSE.txt": b"Preexisting license bytes",
+    }
+    for name, content in originals.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    installed = {
+        "dxgi.dll": b"Renamed OptiScaler DLL",
+        "OptiScaler.ini": b"[DlssNr]\nEnabled=true\nPasses=1\n",
+        "Licenses/OptiScaler/LICENSE.txt": b"Upstream license",
+        "Plugins/helper.dll": b"Bundled helper",
+        "nvngx.dll_dlssnr.dll": b"Bundled NGX proxy",
+    }
+    for name, content in installed.items():
+        path = tmp_path / name
+        prepare_managed_path(rec, path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    prepare_managed_path(rec, tmp_path / "OptiScaler.log")
+    prepare_runtime_artifacts(rec, tmp_path, "OptiScaler.log*")
+    (tmp_path / "OptiScaler.log").write_bytes(b"Current game session")
+    rotated = tmp_path / "OptiScaler.log.1"
+    rotated.write_bytes(b"Generated rotation")
+    empty = tmp_path / "Plugins" / "empty"
+    track_created_directories(rec, empty)
+    empty.mkdir()
+    assert record_save(rec)
+    if finalization_fails:
+        mocker.patch("dlss5_enabler.operations.uninstall.index_remove", return_value=False)
+
+    assert run_uninstall(tmp_path) is not finalization_fails
+
+    if finalization_fails:
+        for name, content in installed.items():
+            assert (tmp_path / name).read_bytes() == content
+        assert (tmp_path / "OptiScaler.log").read_bytes() == b"Current game session"
+        assert rotated.read_bytes() == b"Generated rotation"
+        assert empty.is_dir()
+        assert rec.record_path().is_file()
+        assert all(Path(item.backup).is_file() for item in rec.files if item.backup)
+    else:
+        for name, content in originals.items():
+            assert (tmp_path / name).read_bytes() == content
+        assert (tmp_path / "Licenses" / "OptiScaler").is_dir()
+        assert not (tmp_path / "Plugins").exists()
+        assert not (tmp_path / "nvngx.dll_dlssnr.dll").exists()
+        assert not rotated.exists()
+        assert not rec.record_path().exists()
+        assert not any(Path(item.backup).exists() for item in rec.files if item.backup)
+
+
+@pytest.mark.parametrize("finalization_fails", [False, True])
+def test_owned_optiscaler_capture_directory_is_snapshotted_and_cleaned_by_inventory(
+    tmp_path: Path, mocker: MockerFixture, finalization_fails: bool
+) -> None:
+    rec = _optiscaler_record(tmp_path)
+    capture_dir = tmp_path / "dlssnr-capture"
+    track_created_directories(rec, capture_dir)
+    prepare_runtime_artifacts(rec, capture_dir, "*.png")
+    capture_dir.mkdir()
+    captured = capture_dir / "before.png"
+    captured.write_bytes(b"Generated comparison frame")
+    assert record_save(rec)
+    if finalization_fails:
+        mocker.patch("dlss5_enabler.operations.uninstall.index_remove", return_value=False)
+
+    assert run_uninstall(tmp_path) is not finalization_fails
+
+    assert capture_dir.exists() is finalization_fails
+    if finalization_fails:
+        assert captured.read_bytes() == b"Generated comparison frame"
+        assert rec.record_path().is_file()
+
+
+def test_optiscaler_capture_cleanup_preserves_files_outside_recorded_pattern(tmp_path: Path) -> None:
+    rec = _optiscaler_record(tmp_path)
+    capture_dir = tmp_path / "dlssnr-capture"
+    track_created_directories(rec, capture_dir)
+    prepare_runtime_artifacts(rec, capture_dir, "*.png")
+    capture_dir.mkdir()
+    generated = capture_dir / "before.png"
+    generated.write_bytes(b"Generated frame")
+    unknown = capture_dir / "user-notes.txt"
+    unknown.write_bytes(b"User notes after installation")
+    assert record_save(rec)
+
+    assert run_uninstall(tmp_path)
+
+    assert unknown.read_bytes() == b"User notes after installation"
+    assert not generated.exists()
+
+
+def test_optiscaler_untracked_runtime_names_are_preserved(tmp_path: Path) -> None:
+    rec = _optiscaler_record(tmp_path)
+    log_path = tmp_path / "OptiScaler.log"
+    log_path.write_bytes(b"Untracked log")
+    capture_dir = tmp_path / "dlssnr-capture"
+    capture_dir.mkdir()
+    captured = capture_dir / "before.png"
+    captured.write_bytes(b"Untracked frame")
+    assert record_save(rec)
+
+    assert run_uninstall(tmp_path)
+
+    assert log_path.read_bytes() == b"Untracked log"
+    assert captured.read_bytes() == b"Untracked frame"
+
+
+def test_runtime_preparation_rejects_unknown_preexisting_capture_directory(tmp_path: Path) -> None:
+    rec = _optiscaler_record(tmp_path)
+    capture_dir = tmp_path / "dlssnr-capture"
+    capture_dir.mkdir()
+    user_file = capture_dir / "before.png"
+    user_file.write_bytes(b"User frame")
+
+    with pytest.raises(ValueError, match="not owned"):
+        prepare_runtime_artifacts(rec, capture_dir, "*.png")
+
+    assert rec.runtime_artifacts == []
+    assert user_file.read_bytes() == b"User frame"
+
+
+def test_invalid_created_directory_is_rejected_before_reverting_proxy(tmp_path: Path) -> None:
+    game = tmp_path / "game"
+    game.mkdir()
+    foreign = tmp_path / "outside"
+    foreign.mkdir()
+    rec = _optiscaler_record(game)
+    proxy = game / "dxgi.dll"
+    proxy.write_bytes(b"Installed proxy")
+    rec.files = [RecordedFile(path=proxy.as_posix())]
+    rec.created_directories = [foreign.as_posix()]
+
+    assert not revert_record_mutations(rec)
+
+    assert proxy.read_bytes() == b"Installed proxy"
+    assert foreign.is_dir()
+
+
+def test_invalid_runtime_rule_is_rejected_before_reverting_proxy(tmp_path: Path) -> None:
+    rec = _optiscaler_record(tmp_path)
+    proxy = tmp_path / "dxgi.dll"
+    proxy.write_bytes(b"Installed proxy")
+    rec.files = [RecordedFile(path=proxy.as_posix())]
+    rec.runtime_artifacts = [RuntimeArtifacts(directory=tmp_path.as_posix(), pattern="../*.log")]
+
+    assert not revert_record_mutations(rec)
+
+    assert proxy.read_bytes() == b"Installed proxy"
+
+
+def test_runtime_capture_symlink_cannot_escape_installation(tmp_path: Path) -> None:
+    game = tmp_path / "game"
+    game.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    external = outside / "before.png"
+    external.write_bytes(b"External user frame")
+    capture_dir = game / "dlssnr-capture"
+    rec = _optiscaler_record(game)
+    track_created_directories(rec, capture_dir)
+    prepare_runtime_artifacts(rec, capture_dir, "*.png")
+    try:
+        capture_dir.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("Creating directory symlinks requires permission on this platform")
+    proxy = game / "dxgi.dll"
+    proxy.write_bytes(b"Installed proxy")
+    rec.files = [RecordedFile(path=proxy.as_posix())]
+
+    assert not revert_record_mutations(rec)
+
+    assert proxy.read_bytes() == b"Installed proxy"
+    assert external.read_bytes() == b"External user frame"

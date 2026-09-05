@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from dlss5_enabler.core.archive import safe_archive_destination
-from dlss5_enabler.core.fileio import atomic_write_bytes, atomic_write_text, resource_lock
+from dlss5_enabler.core.fileio import _atomic_copy_file_unlocked, atomic_write_bytes, atomic_write_text, resource_lock
 from dlss5_enabler.core.record import BinaryInfo
 from dlss5_enabler.core.util import get_cache_dir, sha256_file
 from dlss5_enabler.network.adapters import (
@@ -138,6 +138,66 @@ class FeederBundle:
         self.vk_layer_zip: Path | None = None
         self.binaries: dict[str, BinaryInfo] = {}
         self.warnings: tuple[ResolutionWarning, ...] = ()
+
+
+class OptiScalerBundle:
+    def __init__(self) -> None:
+        self.archive_path: Path | None = None
+        self.variant: str = ""
+        self.source_revision: str = ""
+        self.binaries: dict[str, BinaryInfo] = {}
+        self.warnings: tuple[ResolutionWarning, ...] = ()
+
+
+def fetch_optiscaler(
+    log: LogFn,
+    progress: ProgressFn | None = None,
+    force: bool = False,
+    archive_path: Path | None = None,
+    source_revision: str = "",
+) -> OptiScalerBundle:
+    del log, progress, force
+    expected_digest = "f927b5aed15d09b23f559433d6740834f550d79bb2b75c7315602319819a3096"
+    out = OptiScalerBundle()
+    if archive_path is not None:
+        archive = archive_path.expanduser().resolve()
+        if not archive.is_file():
+            raise FileNotFoundError(f"OptiScaler archive not found: {archive}")
+        digest = sha256_file(archive)
+        if digest != expected_digest:
+            raise ValueError(f"Unsupported OptiScaler archive SHA-256: {digest}")
+        cache_path = get_cache_dir() / f"OptiScaler-y4my4my4m-v3-{digest}.zip"
+        with resource_lock(cache_path):
+            if not cache_path.is_file() or sha256_file(cache_path) != digest:
+                _atomic_copy_file_unlocked(archive, cache_path)
+        out.archive_path = cache_path
+        out.variant = "y4my4my4m-v3"
+        out.source_revision = digest
+        out.binaries[archive.name] = BinaryInfo(
+            name=archive.name,
+            version=out.variant,
+            sha256=digest,
+            size_bytes=archive.stat().st_size,
+            source_revision=digest,
+        )
+        return out
+    revision = source_revision or expected_digest
+    if revision != expected_digest:
+        raise ValueError(f"Unsupported OptiScaler source revision: {revision}")
+    cache_path = get_cache_dir() / f"OptiScaler-y4my4my4m-v3-{revision}.zip"
+    if not cache_path.is_file() or sha256_file(cache_path) != revision:
+        raise FileNotFoundError("The recorded OptiScaler archive is not available in the verified local cache")
+    out.archive_path = cache_path
+    out.variant = "y4my4my4m-v3"
+    out.source_revision = revision
+    out.binaries[cache_path.name] = BinaryInfo(
+        name=cache_path.name,
+        version=out.variant,
+        sha256=revision,
+        size_bytes=cache_path.stat().st_size,
+        source_revision=revision,
+    )
+    return out
 
 
 def fetch_feeder(log: LogFn, progress: ProgressFn | None = None, force: bool = False) -> FeederBundle:
@@ -299,23 +359,31 @@ def _resolve_ngx(
     )
 
 
-def fetch_ngx_dlls(log: LogFn, progress: ProgressFn | None = None, force: bool = False) -> NgxBundle:
+def fetch_ngx_dlls(
+    log: LogFn,
+    progress: ProgressFn | None = None,
+    force: bool = False,
+    *,
+    include_sr: bool = True,
+) -> NgxBundle:
     out = NgxBundle()
     cache_dir = get_cache_dir()
     manifest_result = _resolve_rhi_manifest(log, cache_dir, progress, force)
     manifest = RhiManifestPayload.model_validate_json(manifest_result.path.read_bytes())
     short_fuse = tuple(entry for entry in manifest.dlssnr if "SF" in entry.version)
     nr_entry = max(short_fuse or manifest.dlssnr, key=lambda entry: _version_key(entry.version))
-    sr_entry = max(manifest.dlss, key=lambda entry: _version_key(entry.version))
     nr_result = _resolve_ngx("ngx_nr", nr_entry, cache_dir / "nvngx_dlssnr.zip", log, progress, force)
-    sr_result = _resolve_ngx("ngx_sr", sr_entry, cache_dir / "nvngx_dlss.zip", log, progress, force)
     out.nr_version = nr_result.revision.removeprefix("dlssnr-")
-    out.sr_version = sr_result.revision.removeprefix("dlss-")
-    out.warnings = manifest_result.warnings + nr_result.warnings + sr_result.warnings
+    out.warnings = manifest_result.warnings + nr_result.warnings
     out.nr_dll_path = zip_extract_matching(nr_result.path, cache_dir, ["*nvngx_dlssnr.dll"], flatten=True)[0]
-    out.sr_dll_path = zip_extract_matching(sr_result.path, cache_dir, ["*nvngx_dlss.dll"], flatten=True)[0]
     out.binaries["nvngx_dlssnr.dll"] = _binary(out.nr_dll_path, "nvngx_dlssnr.dll", nr_result)
-    out.binaries["nvngx_dlss.dll"] = _binary(out.sr_dll_path, "nvngx_dlss.dll", sr_result)
+    if include_sr:
+        sr_entry = max(manifest.dlss, key=lambda entry: _version_key(entry.version))
+        sr_result = _resolve_ngx("ngx_sr", sr_entry, cache_dir / "nvngx_dlss.zip", log, progress, force)
+        out.sr_version = sr_result.revision.removeprefix("dlss-")
+        out.warnings += sr_result.warnings
+        out.sr_dll_path = zip_extract_matching(sr_result.path, cache_dir, ["*nvngx_dlss.dll"], flatten=True)[0]
+        out.binaries["nvngx_dlss.dll"] = _binary(out.sr_dll_path, "nvngx_dlss.dll", sr_result)
     return out
 
 

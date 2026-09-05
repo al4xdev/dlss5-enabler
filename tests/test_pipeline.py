@@ -16,6 +16,7 @@ from dlss5_enabler.core.record import (
     InstallRecord,
     RecordedFile,
     RegistryTouch,
+    RenoDxStrategyOptions,
     RuntimeArtifacts,
     index_add,
     index_load,
@@ -1485,6 +1486,7 @@ def test_synthetic_game_update_round_trip(
     assert previous is not None
     previous.tool_version = "1.0.0"
     previous.install_options = InstallOptions(lumenite=False)
+    previous.strategy_options = RenoDxStrategyOptions.from_install_options(previous.install_options)
     assert record_save(previous)
     mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.1.0")
     mocker.patch("dlss5_enabler.operations.steps_common.get_tool_version", return_value="1.1.0")

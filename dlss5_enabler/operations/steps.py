@@ -19,6 +19,7 @@ from dlss5_enabler.core.record import (
     InstallOptions,
     RecordedFile,
     RegistryTouch,
+    RenoDxStrategyOptions,
 )
 from dlss5_enabler.core.util import (
     get_cache_dir,
@@ -168,6 +169,7 @@ class StepConfigureRenoDx(PipelineStep[RenoDxContext]):
             opengl=ctx.opengl,
             vulkan_layer=ctx.install_vulkan_layer,
         )
+        ctx.record.strategy_options = RenoDxStrategyOptions.from_install_options(ctx.record.install_options)
         logger.info(
             f"Selected engine: {ctx.strategy.value}; native_dlss={analysis.native_dlss}; proxy={ctx.reshade_dll_name}"
         )

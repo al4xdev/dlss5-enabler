@@ -19,14 +19,16 @@ if sys.platform == "win32":
 from dlss5_enabler.check import run_all_checks
 from dlss5_enabler.core.logger import get_log_dir, get_logger, setup_logger
 from dlss5_enabler.core.pe import check_api_mismatches, detect_game_apis, detect_pe_arch
-from dlss5_enabler.core.record import index_load_active, record_load
+from dlss5_enabler.core.record import InstallRecord, OptiScalerStrategyOptions, index_load_active, record_load
 from dlss5_enabler.core.util import file_is_writable, get_cache_dir, get_permission_guidance, is_directory_writable
 from dlss5_enabler.core.version import InstallVersionStatus, get_install_version_status, get_tool_version
 from dlss5_enabler.network.update_check import UpdateCheckResult, check_for_update
+from dlss5_enabler.operations.capabilities import analyze_capabilities
 from dlss5_enabler.operations.install import run_install
 from dlss5_enabler.operations.uninstall import run_uninstall
 from dlss5_enabler.operations.update import GameUpdateStatus, run_update
 from dlss5_enabler.platform import ProtonManager, get_platform_adapter
+from dlss5_enabler.schemas.strategy import InstallStrategy
 
 app: typer.Typer = typer.Typer(
     name="dlss5-enabler",
@@ -99,6 +101,26 @@ def _show_reshade_activation_guide(lumenite: bool, native_dlss: bool = False) ->
             border_style="cyan",
         )
     )
+
+
+def _show_optiscaler_activation_guide() -> None:
+    console.print(
+        Panel.fit(
+            "[bold cyan]OptiScaler installed[/bold cyan]\n\n"
+            "1. Start the game in DirectX 11 or DirectX 12 and enable its native DLSS option.\n"
+            "2. Press [bold]Delete[/bold] to open the OptiScaler overlay.\n"
+            "3. DLSS Neural Rendering starts enabled with the recorded number of passes.",
+            title="[bold cyan]Activate OptiScaler[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+
+def _show_activation_guide(record: InstallRecord | None, lumenite: bool) -> None:
+    if record is not None and record.strategy is InstallStrategy.OPTISCALER:
+        _show_optiscaler_activation_guide()
+        return
+    _show_reshade_activation_guide(lumenite, record.native_dlss_detected if record is not None else False)
 
 
 def _path_size(path: Path) -> int:
@@ -192,6 +214,22 @@ def install_cmd(
             help="Install Vulkan layer fallback for Vulkan games",
         ),
     ] = False,
+    engine: Annotated[
+        InstallStrategy,
+        typer.Option("--engine", help="Installation engine: renodx or optiscaler"),
+    ] = InstallStrategy.RENODX,
+    optiscaler_archive: Annotated[
+        Path | None,
+        typer.Option("--optiscaler-archive", help="Verified y4my4my4m v3 ZIP for OptiScaler"),
+    ] = None,
+    nr_passes: Annotated[
+        int,
+        typer.Option("--nr-passes", min=1, max=5, help="DLSS Neural Rendering passes for OptiScaler"),
+    ] = 1,
+    optiscaler_proxy: Annotated[
+        str,
+        typer.Option("--optiscaler-proxy", help="OptiScaler proxy DLL filename"),
+    ] = "dxgi.dll",
     force_download: Annotated[
         bool,
         typer.Option(
@@ -215,6 +253,16 @@ def install_cmd(
     if d3d9 and opengl:
         console.print("[bold red]--d3d9 and --opengl cannot be used together.[/bold red]")
         raise typer.Exit(code=2)
+    if engine is InstallStrategy.OPTISCALER and (d3d9 or opengl or vulkan_layer):
+        console.print(
+            "[bold red]OptiScaler currently supports only DirectX 11/12 without translation flags.[/bold red]"
+        )
+        raise typer.Exit(code=2)
+    if engine is InstallStrategy.RENODX and (
+        optiscaler_archive is not None or nr_passes != 1 or optiscaler_proxy != "dxgi.dll"
+    ):
+        console.print("[bold red]OptiScaler options require --engine optiscaler.[/bold red]")
+        raise typer.Exit(code=2)
     adapter = get_platform_adapter()
     console.print(
         Panel.fit(
@@ -225,6 +273,7 @@ def install_cmd(
             f"D3D9 dgVoodoo2: [{'green' if d3d9 else 'dim'}]{'Yes' if d3d9 else 'No'}[/]\n"
             f"OpenGL Mode: [{'green' if opengl else 'dim'}]{'Yes' if opengl else 'No'}[/]\n"
             f"Vulkan Layer: [{'green' if vulkan_layer else 'dim'}]{'Yes' if vulkan_layer else 'No'}[/]\n"
+            f"Engine: [green]{engine.value}[/green]\n"
             f"Force Re-download: [{'yellow' if force_download else 'dim'}]{'Yes' if force_download else 'No'}[/]",
             border_style="cyan",
         )
@@ -238,6 +287,10 @@ def install_cmd(
         install_vulkan_layer=vulkan_layer,
         force_download=force_download,
         verbose=verbose,
+        strategy=engine,
+        optiscaler_archive=optiscaler_archive,
+        optiscaler_nr_passes=nr_passes,
+        optiscaler_proxy=optiscaler_proxy,
     )
     if not success:
         console.print(
@@ -257,7 +310,7 @@ def install_cmd(
                 border_style="green",
             )
         )
-    _show_reshade_activation_guide(lumenite, rec.native_dlss_detected if rec is not None else False)
+    _show_activation_guide(rec, lumenite)
 
 
 @app.command(name="uninstall")
@@ -295,6 +348,22 @@ def update_cmd(
         bool,
         typer.Option("--force-download", "-f", help="Bypass component caches during the update"),
     ] = False,
+    engine: Annotated[
+        InstallStrategy | None,
+        typer.Option("--engine", help="Explicitly switch or reapply an installation engine"),
+    ] = None,
+    optiscaler_archive: Annotated[
+        Path | None,
+        typer.Option("--optiscaler-archive", help="Verified y4my4my4m v3 ZIP for OptiScaler"),
+    ] = None,
+    nr_passes: Annotated[
+        int | None,
+        typer.Option("--nr-passes", min=1, max=5, help="Override saved OptiScaler NR passes"),
+    ] = None,
+    optiscaler_proxy: Annotated[
+        str | None,
+        typer.Option("--optiscaler-proxy", help="Override saved OptiScaler proxy DLL filename"),
+    ] = None,
     verbose: Annotated[
         bool,
         typer.Option("--verbose", "-v", help="Enable verbose debug logging"),
@@ -309,6 +378,10 @@ def update_cmd(
         force_download=force_download,
         verbose=verbose,
         log=console.print,
+        strategy=engine,
+        optiscaler_archive=optiscaler_archive,
+        optiscaler_nr_passes=nr_passes,
+        optiscaler_proxy=optiscaler_proxy,
     )
     style = "green" if result.success else "red"
     console.print(f"[bold {style}]{result.message}[/bold {style}]")
@@ -316,10 +389,7 @@ def update_cmd(
         raise typer.Exit(code=1)
     if result.status in {GameUpdateStatus.UPDATED, GameUpdateStatus.REINSTALLED}:
         record = record_load(resolved_target.parent if resolved_target.is_file() else resolved_target)
-        _show_reshade_activation_guide(
-            result.options.lumenite if result.options is not None else True,
-            record.native_dlss_detected if record is not None else False,
-        )
+        _show_activation_guide(record, result.options.lumenite if result.options is not None else True)
 
 
 @app.command(name="list")
@@ -368,6 +438,8 @@ def info_cmd(
     game_dir = exe.parent
     rec = record_load(game_dir)
     detected_apis = detect_game_apis(exe)
+    if not detected_apis:
+        detected_apis = list(analyze_capabilities(exe, rec).apis)
     prefix_info = ProtonManager.find_prefix_for_game(exe)
 
     table = Table(title=f"Game Info: {exe.name}", border_style="cyan")
@@ -393,13 +465,20 @@ def info_cmd(
         table.add_row("Install Status", _version_status_markup(status))
         table.add_row("Record Schema", str(rec.schema_version))
         table.add_row("Installed Engine", rec.strategy.value)
-        table.add_row(
-            "Saved Options",
-            f"Lumenite={'Yes' if options.lumenite else 'No'}, "
-            f"D3D9={'Yes' if options.d3d9 else 'No'}, "
-            f"OpenGL={'Yes' if options.opengl else 'No'}, "
-            f"Vulkan={'Yes' if options.vulkan_layer else 'No'}",
-        )
+        if isinstance(rec.strategy_options, OptiScalerStrategyOptions):
+            table.add_row(
+                "Saved Options",
+                f"Variant={rec.strategy_options.variant}, Proxy={rec.strategy_options.proxy_name}, "
+                f"NR passes={rec.strategy_options.nr_passes}, Revision={rec.strategy_options.source_revision}",
+            )
+        else:
+            table.add_row(
+                "Saved Options",
+                f"Lumenite={'Yes' if options.lumenite else 'No'}, "
+                f"D3D9={'Yes' if options.d3d9 else 'No'}, "
+                f"OpenGL={'Yes' if options.opengl else 'No'}, "
+                f"Vulkan={'Yes' if options.vulkan_layer else 'No'}",
+            )
         table.add_row("Platform", rec.platform)
         table.add_row("Install Type", rec.install_type)
         table.add_row("Total Files Placed", str(len(rec.files)))

@@ -268,7 +268,8 @@ def test_fetch_renodx_selects_highest_version(tmp_path: Path, mocker: MockerFixt
     assert bundle.addon64_path.read_bytes() == b"https://example.com/new.zip"
 
 
-def test_fetch_ngx_dlls(tmp_path: Path, mocker: MockerFixture) -> None:
+@pytest.mark.parametrize("include_sr", [True, False])
+def test_fetch_ngx_dlls(tmp_path: Path, mocker: MockerFixture, include_sr: bool) -> None:
     mocker.patch("dlss5_enabler.network.sources.get_cache_dir", return_value=tmp_path)
     mock_manifest: dict[str, Any] = {
         "dlssnr": [{"version": "310.8.SF-v2", "url": "https://example.com/nr.zip"}],
@@ -290,16 +291,21 @@ def test_fetch_ngx_dlls(tmp_path: Path, mocker: MockerFixture) -> None:
 
     download = mocker.patch("dlss5_enabler.network.sources.http_download_file", side_effect=mock_download)
 
-    bundle = fetch_ngx_dlls(log=lambda msg: None, force=True)
+    bundle = fetch_ngx_dlls(log=lambda _message: None, force=True, include_sr=include_sr)
     assert bundle.nr_version == "310.8.SF-v2"
-    assert bundle.sr_version == "310.8.0"
     assert bundle.nr_dll_path is not None and bundle.nr_dll_path.is_file()
-    assert bundle.sr_dll_path is not None and bundle.sr_dll_path.is_file()
-    assert [item.args[0] for item in download.call_args_list] == [
+    expected_urls = [
         f"https://raw.githubusercontent.com/RankFTW/RHI/{MANIFEST_REVISION}/dlss_manifest.json",
         "https://example.com/nr.zip",
-        "https://example.com/sr.zip",
     ]
+    if include_sr:
+        expected_urls.append("https://example.com/sr.zip")
+        assert bundle.sr_version == "310.8.0"
+        assert bundle.sr_dll_path is not None and bundle.sr_dll_path.is_file()
+    else:
+        assert bundle.sr_version == ""
+        assert bundle.sr_dll_path is None
+    assert [item.args[0] for item in download.call_args_list] == expected_urls
     metadata.assert_called_once_with("https://api.github.com/repos/RankFTW/RHI/commits/main")
 
 

@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 from pytest_mock import MockerFixture
 
-from dlss5_enabler.core.record import CURRENT_RECORD_SCHEMA_VERSION, InstallOptions, InstallRecord
+from dlss5_enabler.core.record import (
+    CURRENT_RECORD_SCHEMA_VERSION,
+    InstallOptions,
+    InstallRecord,
+    OptiScalerStrategyOptions,
+)
 from dlss5_enabler.operations.pipeline import PipelineResult, PipelineStatus
 from dlss5_enabler.operations.update import GameUpdateStatus, run_update
 from dlss5_enabler.schemas.strategy import InstallStrategy
@@ -95,6 +100,66 @@ def test_reinstall_reapplies_equal_version(tmp_path: Path, mocker: MockerFixture
 
     assert result.status is GameUpdateStatus.REINSTALLED
     install.assert_called_once()
+
+
+def test_update_preserves_saved_optiscaler_source_and_options(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    strategy_options = OptiScalerStrategyOptions(proxy_name="winmm.dll", source_revision="f" * 64, nr_passes=4)
+    record = InstallRecord(
+        schema_version=CURRENT_RECORD_SCHEMA_VERSION,
+        strategy=InstallStrategy.OPTISCALER,
+        strategy_options=strategy_options,
+        install_options=InstallOptions(),
+        game_exe=game_exe.as_posix(),
+        game_dir=tmp_path.as_posix(),
+        tool_version="1.0.0",
+    )
+    record.record_path().write_text(record.model_dump_json(), encoding="utf-8")
+    mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.1.0")
+    install = mocker.patch(
+        "dlss5_enabler.operations.update._run_install_unlocked",
+        return_value=PipelineResult(PipelineStatus.COMPLETED),
+    )
+
+    result = run_update(game_exe)
+
+    assert result.status is GameUpdateStatus.UPDATED
+    install.assert_called_once_with(
+        game_exe,
+        force_download=False,
+        verbose=False,
+        strategy=InstallStrategy.OPTISCALER,
+        optiscaler_archive=None,
+        optiscaler_source_revision="f" * 64,
+        optiscaler_nr_passes=4,
+        optiscaler_proxy="winmm.dll",
+    )
+
+
+def test_explicit_switch_from_renodx_to_optiscaler_passes_archive(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    archive = tmp_path / "opti.zip"
+    game_exe.write_bytes(b"MZ")
+    archive.write_bytes(b"ZIP")
+    _write_record(game_exe, tool_version="1.1.0")
+    mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.1.0")
+    install = mocker.patch(
+        "dlss5_enabler.operations.update._run_install_unlocked",
+        return_value=PipelineResult(PipelineStatus.COMPLETED),
+    )
+
+    result = run_update(
+        game_exe,
+        strategy=InstallStrategy.OPTISCALER,
+        optiscaler_archive=archive,
+        optiscaler_nr_passes=2,
+    )
+
+    assert result.status is GameUpdateStatus.REINSTALLED
+    assert install.call_args.kwargs["strategy"] is InstallStrategy.OPTISCALER
+    assert install.call_args.kwargs["optiscaler_archive"] == archive
+    assert install.call_args.kwargs["optiscaler_nr_passes"] == 2
 
 
 def test_newer_record_refuses_downgrade(tmp_path: Path, mocker: MockerFixture) -> None:

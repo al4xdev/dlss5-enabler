@@ -7,6 +7,7 @@ from dlss5_enabler.network.sources import (
     FeederBundle,
     LumeniteBundle,
     NgxBundle,
+    OptiScalerBundle,
     RenoDxBundle,
     ReshadeBundle,
     ReshadeHeaders,
@@ -37,3 +38,15 @@ class RenoDxContext(PipelineContext):
     lumenite_bundle: LumeniteBundle | None = None
     prepared_reshade: dict[str, Path] = field(default_factory=dict[str, Path])
     staging_directory: Path | None = None
+
+
+@dataclass
+class OptiScalerContext(PipelineContext):
+    archive_path: Path | None = None
+    source_revision: str = ""
+    nr_passes: int = 1
+    proxy_name: str = "dxgi.dll"
+    bundle: OptiScalerBundle | None = None
+    ngx_bundle: NgxBundle | None = None
+    staging_directory: Path | None = None
+    staged_files: dict[str, Path] = field(default_factory=dict[str, Path])

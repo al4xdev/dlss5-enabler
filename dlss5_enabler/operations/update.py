@@ -4,10 +4,17 @@ from enum import Enum
 from pathlib import Path
 
 from dlss5_enabler.core.fileio import resource_lock
-from dlss5_enabler.core.record import InstallOptions, InstallRecord, record_load
+from dlss5_enabler.core.record import (
+    InstallOptions,
+    InstallRecord,
+    OptiScalerStrategyOptions,
+    RenoDxStrategyOptions,
+    record_load,
+)
 from dlss5_enabler.core.version import InstallVersionStatus, get_install_version_status, get_tool_version
 from dlss5_enabler.operations.install import _run_install_unlocked
 from dlss5_enabler.operations.pipeline import PipelineResult, PipelineStatus
+from dlss5_enabler.schemas.strategy import InstallStrategy
 
 LogFn = Callable[[str], None]
 
@@ -72,6 +79,27 @@ def _eligibility_result(
     return None
 
 
+def _selection_result(
+    record: InstallRecord,
+    current_version: str,
+    selected: InstallStrategy,
+    reinstall: bool,
+    explicitly_selected: bool,
+    optiscaler_options_requested: bool,
+) -> GameUpdateResult | None:
+    if optiscaler_options_requested and selected is not InstallStrategy.OPTISCALER:
+        return GameUpdateResult(
+            GameUpdateStatus.FAILED,
+            "OptiScaler options require --engine optiscaler or a saved OptiScaler strategy.",
+            record.tool_version,
+            current_version,
+            record.install_options,
+        )
+    return _eligibility_result(
+        record, current_version, reinstall or explicitly_selected or optiscaler_options_requested
+    )
+
+
 def run_update(
     game_dir_or_exe: Path | str,
     *,
@@ -79,6 +107,10 @@ def run_update(
     force_download: bool = False,
     verbose: bool = False,
     log: LogFn = print,
+    strategy: InstallStrategy | None = None,
+    optiscaler_archive: Path | None = None,
+    optiscaler_nr_passes: int | None = None,
+    optiscaler_proxy: str | None = None,
 ) -> GameUpdateResult:
     target = Path(game_dir_or_exe).resolve()
     game_dir = _find_record_directory(target)
@@ -96,9 +128,21 @@ def run_update(
                 f"Install record is invalid and was preserved: {record_path}",
             )
         current_version = get_tool_version()
-        eligibility = _eligibility_result(record, current_version, reinstall)
-        if eligibility is not None:
-            return eligibility
+        selected = InstallStrategy(strategy) if strategy is not None else record.strategy
+        explicitly_selected = strategy is not None
+        optiscaler_options_requested = any(
+            value is not None for value in (optiscaler_archive, optiscaler_nr_passes, optiscaler_proxy)
+        )
+        selection = _selection_result(
+            record,
+            current_version,
+            selected,
+            reinstall,
+            explicitly_selected,
+            optiscaler_options_requested,
+        )
+        if selection is not None:
+            return selection
         options = record.install_options
         game_exe = target if target.is_file() else Path(record.game_exe)
         if not game_exe.is_absolute():
@@ -111,22 +155,44 @@ def run_update(
                 current_version,
                 options,
             )
+        source_revision = ""
+        nr_passes = optiscaler_nr_passes if optiscaler_nr_passes is not None else 1
+        proxy = optiscaler_proxy or "dxgi.dll"
+        if selected is InstallStrategy.OPTISCALER and isinstance(record.strategy_options, OptiScalerStrategyOptions):
+            source_revision = record.strategy_options.source_revision
+            nr_passes = optiscaler_nr_passes if optiscaler_nr_passes is not None else record.strategy_options.nr_passes
+            proxy = optiscaler_proxy or record.strategy_options.proxy_name
+        if selected is InstallStrategy.RENODX and isinstance(record.strategy_options, RenoDxStrategyOptions):
+            options = record.strategy_options.as_install_options()
         log(
             f"Updating game from DLSS5 Enabler {record.tool_version} to {current_version}; "
+            f"engine: {record.strategy.value} -> {selected.value}; "
             f"options: Lumenite={'yes' if options.lumenite else 'no'}, "
             f"D3D9={'yes' if options.d3d9 else 'no'}, OpenGL={'yes' if options.opengl else 'no'}, "
             f"Vulkan={'yes' if options.vulkan_layer else 'no'}"
         )
-        installation = _run_install_unlocked(
-            game_exe,
-            install_lumenite=options.lumenite,
-            d3d9_translate=options.d3d9,
-            opengl=options.opengl,
-            install_vulkan_layer=options.vulkan_layer,
-            force_download=force_download,
-            verbose=verbose,
-            strategy=record.strategy,
-        )
+        if selected is InstallStrategy.OPTISCALER:
+            installation = _run_install_unlocked(
+                game_exe,
+                force_download=force_download,
+                verbose=verbose,
+                strategy=selected,
+                optiscaler_archive=optiscaler_archive,
+                optiscaler_source_revision=source_revision,
+                optiscaler_nr_passes=nr_passes,
+                optiscaler_proxy=proxy,
+            )
+        else:
+            installation = _run_install_unlocked(
+                game_exe,
+                install_lumenite=options.lumenite,
+                d3d9_translate=options.d3d9,
+                opengl=options.opengl,
+                install_vulkan_layer=options.vulkan_layer,
+                force_download=force_download,
+                verbose=verbose,
+                strategy=selected,
+            )
         if not installation.success:
             recovery_failed = installation.status is PipelineStatus.RECOVERY_FAILED
             message = (
@@ -146,8 +212,12 @@ def run_update(
                 options,
                 installation,
             )
-        result_status = GameUpdateStatus.REINSTALLED if reinstall else GameUpdateStatus.UPDATED
-        message = f"Game installation now uses DLSS5 Enabler {current_version}; engine: {record.strategy.value}."
+        result_status = (
+            GameUpdateStatus.REINSTALLED
+            if reinstall or explicitly_selected or optiscaler_options_requested
+            else GameUpdateStatus.UPDATED
+        )
+        message = f"Game installation now uses DLSS5 Enabler {current_version}; engine: {selected.value}."
         if installation.cleanup_errors:
             message += " Installation is active; cleanup pending: " + "; ".join(installation.cleanup_errors)
         return GameUpdateResult(

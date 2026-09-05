@@ -4,7 +4,7 @@ This file is the operational reference for agents working in this repository. It
 
 ## 1. Product and scope
 
-`dlss5-enabler` is a transactional Python CLI for installing and removing the DLSS5-Feeder stack in Windows games. The CLI runs on Windows, Linux, Wine, Proton, and SteamOS, but the installation target is a Windows PE32 or PE32+ executable.
+`dlss5-enabler` is a transactional Python CLI with isolated RenoDX and OptiScaler installation strategies for Windows games. The RenoDX CLI path runs on Windows, Linux, Wine, Proton, and SteamOS, while the initial OptiScaler path is Windows x64 only. The installation target is a Windows PE32 or PE32+ executable.
 
 The managed stack can include:
 
@@ -16,6 +16,7 @@ The managed stack can include:
 - LumeniteFX;
 - dgVoodoo2 for optional DirectX 9 translation;
 - the Vulkan layer supplied by Feeder.
+- the pinned y4my4my4m OptiScaler DLSSNR Multipass v3 package for native-DLSS DirectX 11/12 games.
 
 The project prioritizes safe failure, rollback, byte-for-byte restoration, verifiable caching, x86/x64 compatibility, and consistent behavior across platforms.
 
@@ -37,7 +38,8 @@ dlss5_enabler/
 │   └── sources.py        component resolution, caching, download, and extraction
 ├── operations/
 │   ├── install.py        concrete strategy selection
-│   ├── contexts.py       RenoDX-specific options and artifacts
+│   ├── contexts.py       strategy-specific options and artifacts
+│   ├── optiscaler.py     explicit OptiScaler pipeline and safe ZIP staging
 │   ├── renodx.py         explicit RenoDX pipeline composition
 │   ├── steps_common.py   analysis, snapshots, and record finalization
 │   ├── pipeline.py       context, steps, commit, and rollback
@@ -94,7 +96,7 @@ Mypy and Pyright run in strict mode.
 
 ### 4.4 Record schemas and migrations
 
-- Installation records use schema 3. Each change adds `schemas/migrations/vN_to_vNplus1.py`, registers its `migrate(data: dict[str, object]) -> dict[str, object]` function in the migration runner, and increments `CURRENT_RECORD_SCHEMA_VERSION` there.
+- Installation records use schema 4. Each change adds `schemas/migrations/vN_to_vNplus1.py`, registers its `migrate(data: dict[str, object]) -> dict[str, object]` function in the migration runner, and increments `CURRENT_RECORD_SCHEMA_VERSION` there.
 - Keep historical transitions. Each migration advances exactly one version, operates on a copy, and performs no filesystem or network access. Test every supported starting version through the current schema, plus malformed and future versions.
 - Missing schema means legacy version 1. Reading migrates only in memory; normal transactional saving revalidates and persists the current schema. Never rewrite a game record merely to inspect it.
 - Persist the concrete strategy and requested options. Do not infer ownership of legacy runtime files from their names when no inventory was recorded.
@@ -108,7 +110,7 @@ Mypy and Pyright run in strict mode.
 - Preserve a known-good destination when refresh, download, validation, or installation fails.
 - Extract archives only through `safe_archive_destination()` or helpers that use it.
 - Reject absolute paths, `..`, destination escapes, and collisions caused by flattening.
-- Common pipeline steps receive `PipelineContext`; RenoDX steps receive `RenoDxContext`. Keep rendering-specific state out of the common context.
+- Common pipeline steps receive `PipelineContext`; strategy steps receive `RenoDxContext` or `OptiScalerContext`. Keep rendering-specific state out of the common context.
 - A new pipeline step must implement error handling, rollback, and commit behavior consistent with its mutations. `commit()` is critical finalization and may trigger rollback; `cleanup()` runs after commitment and must only discard temporary state.
 - Stage and validate every selected artifact before removing an existing installation. ReShade setup is extracted in staging and never executed by the installation pipeline.
 - Use `core/mutations.py` to snapshot files before editing, register newly created directories, and inventory owned runtime artifacts. Keep original bytes when updating existing INIs.
@@ -158,6 +160,8 @@ New mirrors must implement `DownloadSourceAdapter` and return the same provider-
 - ReShade Addon comes from the official website rather than GitHub, but it uses the same HTTP bounds and guarantees.
 - ReShade headers and LumeniteFX must resolve to immutable commits.
 - dgVoodoo2 requires the real release asset and the correct x86/x64 subdirectory. Do not assume versioned filenames.
+- OptiScaler initially accepts only the y4my4my4m v3 local ZIP with SHA-256 `f927b5aed15d09b23f559433d6740834f550d79bb2b75c7315602319819a3096`. Persist its variant and digest, reuse only a matching hash-addressed cache entry, and never substitute another fork implicitly.
+- OptiScaler is initially limited to Windows x64 native-DLSS DirectX 11/12 targets. Preserve the game's native `nvngx_dlss.dll`, disable automatic capture, and refuse preexisting `dlssnr-capture` or trigger paths because the runtime can delete them.
 
 ### 6.1 Component integration playbook
 

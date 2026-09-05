@@ -8,6 +8,11 @@ from pathlib import Path
 
 from dlss5_enabler.core.fileio import atomic_copy_file, atomic_write_text, resource_lock
 from dlss5_enabler.core.ini import ini_set_exact
+from dlss5_enabler.core.mutations import (
+    managed_created_directories,
+    reject_reparse_ancestors,
+    validate_runtime_directory,
+)
 from dlss5_enabler.core.record import (
     IndexEntrySnapshot,
     InstallRecord,
@@ -49,17 +54,9 @@ def _recorded_files(rec: InstallRecord) -> list[RecordedFile]:
 
 def _runtime_artifacts(rec: InstallRecord) -> list[Path]:
     recorded = {Path(item.path).resolve() for item in rec.files}
-    roots = {Path(rec.game_dir).resolve(), rec.effective_reshade_dir().resolve()}
-    if rec.d3d9_translate:
-        roots.add((Path(rec.game_dir) / "bin").resolve())
-    allowed = roots | {root / "host64" for root in roots}
     found: set[Path] = set()
     for rule in rec.runtime_artifacts:
-        directory = Path(rule.directory)
-        if directory.is_symlink() or directory.resolve() not in allowed:
-            raise ValueError(f"Runtime artifact directory is outside the managed installation: {directory}")
-        if not rule.pattern or rule.pattern in {".", ".."} or any(token in rule.pattern for token in ("/", "\\", "**")):
-            raise ValueError(f"Invalid runtime artifact pattern: {rule.pattern}")
+        directory = validate_runtime_directory(rec, Path(rule.directory), rule.pattern)
         preexisting = {Path(path).resolve() for path in rule.preexisting}
         for path in directory.glob(rule.pattern):
             resolved = path.resolve()
@@ -98,7 +95,7 @@ def capture_install_snapshot(rec: InstallRecord) -> InstallSnapshot:
                 files[resolved] = saved
             else:
                 missing_files.append(resolved)
-        directories = [Path(path).resolve().as_posix() for path in rec.created_directories if Path(path).is_dir()]
+        directories = [path.as_posix() for path in managed_created_directories(rec) if path.is_dir()]
         index_entry = capture_index_entry(rec.game_dir)
         snapshot = InstallSnapshot(
             root=root,
@@ -181,6 +178,13 @@ def restore_install_snapshot(snapshot: InstallSnapshot, *, cleanup: bool = True)
 def _validate_backups(rec: InstallRecord, log: LogFn) -> bool:
     for item in _recorded_files(rec):
         path = Path(item.path)
+        try:
+            reject_reparse_ancestors(path)
+            if item.backup:
+                reject_reparse_ancestors(Path(item.backup))
+        except ValueError as error:
+            log(str(error))
+            return False
         if path.is_symlink() or (path.exists() and not path.is_file()):
             log(f"Cannot restore a destination that is not a regular file: {path}")
             return False
@@ -208,17 +212,20 @@ def _restore_recorded_file(item: RecordedFile, log: LogFn) -> bool:
         return False
 
 
-def _cleanup_created_directories(rec: InstallRecord) -> None:
-    for directory in sorted(
-        {Path(path) for path in rec.created_directories}, key=lambda path: len(path.parts), reverse=True
-    ):
-        if directory.is_symlink():
-            continue
+def _cleanup_created_directories(directories: list[Path]) -> None:
+    for directory in sorted(set(directories), key=lambda path: len(path.parts), reverse=True):
+        reject_reparse_ancestors(directory)
         if directory.is_dir() and not any(directory.iterdir()):
             directory.rmdir()
 
 
 def revert_record_mutations(rec: InstallRecord, log: LogFn = print) -> bool:
+    try:
+        artifacts = _runtime_artifacts(rec)
+        directories = managed_created_directories(rec)
+    except Exception as error:
+        log(f"Could not validate managed runtime artifacts or directories: {error}")
+        return False
     if not _validate_backups(rec, log):
         return False
     success = True
@@ -252,10 +259,11 @@ def revert_record_mutations(rec: InstallRecord, log: LogFn = print) -> bool:
             success = False
     if success:
         try:
-            for artifact in _runtime_artifacts(rec):
+            for artifact in artifacts:
                 with resource_lock(artifact):
+                    reject_reparse_ancestors(artifact)
                     artifact.unlink(missing_ok=True)
-            _cleanup_created_directories(rec)
+            _cleanup_created_directories(directories)
         except Exception as error:
             log(f"Could not remove managed runtime artifacts or directories: {error}")
             success = False

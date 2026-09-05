@@ -3,14 +3,16 @@ from copy import deepcopy
 
 from dlss5_enabler.schemas.migrations.v1_to_v2 import migrate as migrate_v1_to_v2
 from dlss5_enabler.schemas.migrations.v2_to_v3 import migrate as migrate_v2_to_v3
+from dlss5_enabler.schemas.migrations.v3_to_v4 import migrate as migrate_v3_to_v4
 
-CURRENT_RECORD_SCHEMA_VERSION = 3
+CURRENT_RECORD_SCHEMA_VERSION = 4
 
 RecordMigration = Callable[[dict[str, object]], dict[str, object]]
 
 _MIGRATIONS: dict[int, RecordMigration] = {
     1: migrate_v1_to_v2,
     2: migrate_v2_to_v3,
+    3: migrate_v3_to_v4,
 }
 
 

@@ -1,18 +1,19 @@
 # DLSS5 Enabler
 
-Transactional command-line installer for managing the DLSS5-Feeder Neural Rendering stack in Windows games, either natively or through Wine and Proton.
+Transactional command-line installer for managing RenoDX/Feeder and OptiScaler Neural Rendering strategies in Windows games.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![CI](https://github.com/al4xdev/dlss5-enabler/actions/workflows/ci.yml/badge.svg)](https://github.com/al4xdev/dlss5-enabler/actions/workflows/ci.yml)
 [![Typing](https://img.shields.io/badge/typing-mypy%20%2B%20pyright%20strict-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 
-DLSS5 Enabler automates a setup that would otherwise require manually coordinating several upstream projects, selecting the correct 32-bit or 64-bit binaries, configuring ReShade, editing Wine overrides, and preserving enough state to undo every change later. The CLI runs on Windows and experimental Linux / SteamOS, while the installation target is always a Windows PE executable.
+DLSS5 Enabler automates setups that would otherwise require manually coordinating several upstream projects, selecting the correct binaries, configuring a proxy, and preserving enough state to undo every change later. RenoDX remains the general strategy on Windows and experimental Linux / SteamOS. The initial OptiScaler strategy is limited to native-DLSS x64 games on Windows using DirectX 11 or 12.
 
 It combines:
 
 - [DLSS5-Feeder](https://github.com/jlrouzies-fr/DLSS5-Feeder)
 - [RenoDX](https://github.com/RankFTW/rhi-repo)
+- [OptiScaler DLSSNR Multipass](https://github.com/y4my4my4m/OptiScaler_DLSSNR_Multipass_MFG)
 - [ReShade with Addon support](https://reshade.me/)
 - NVIDIA NGX DLSS binaries discovered through the RenoDX manifest
 - [LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) motion-vector shaders
@@ -65,6 +66,7 @@ These protections reduce the chance of a broken game directory, but they cannot 
 | Rendering path | Mode | Installed integration |
 | --- | --- | --- |
 | DirectX 11 / 12 | Default | ReShade `dxgi.dll` |
+| Native DLSS on Windows x64 DirectX 11 / 12 | `--engine optiscaler` | Validated OptiScaler proxy, default `dxgi.dll` |
 | DirectX 9 | `--d3d9` | dgVoodoo2 translation plus the 64-bit feeder host when required |
 | OpenGL | `--opengl` | ReShade `opengl32.dll` |
 | Vulkan | `--vulkan-layer` | Feeder Vulkan-layer fallback when available upstream |
@@ -89,6 +91,7 @@ The installation target must be a Windows PE executable. Native Linux ELF binari
 - An NVIDIA RTX GPU supported by the downloaded NGX runtime
 - A game installation you can write to
 - Internet access for the first component download
+- The exact supported y4my4my4m v3 ZIP when first selecting OptiScaler
 
 ## Install
 
@@ -167,10 +170,17 @@ Options:
 | `--d3d9` | Install the dgVoodoo2 DirectX 9 translation path |
 | `--opengl` | Use the OpenGL ReShade hook |
 | `--vulkan-layer` | Request the Vulkan-layer fallback |
+| `--engine renodx` | Use the RenoDX/ReShade strategy; this is the default |
+| `--engine optiscaler` | Use OptiScaler for a supported native-DLSS Windows x64 game |
+| `--optiscaler-archive PATH` | Import the supported y4my4my4m v3 ZIP and cache it by SHA-256 |
+| `--nr-passes 1..5` | Set the OptiScaler DLSS Neural Rendering pass count |
+| `--optiscaler-proxy NAME` | Select a supported proxy filename; defaults to `dxgi.dll` |
 | `-f`, `--force-download` | Ignore cached assets and fetch them again |
 | `-v`, `--verbose` | Enable detailed console and file logging |
 
 `--d3d9` and `--opengl` cannot be combined.
+
+The supported OptiScaler archive is `OptiScaler_DLSSNR_MultiPass_MFG6X_fix_v3_by_y4my4my4m.zip` with SHA-256 `f927b5aed15d09b23f559433d6740834f550d79bb2b75c7315602319819a3096`. The author currently publishes this build outside GitHub releases; the CLI does not invent a download URL or silently replace it with another fork.
 
 ### Update a managed game
 
@@ -179,9 +189,9 @@ dlss5-enabler update "/path/to/game.exe"
 dlss5-enabler update Control_DX12.exe
 ```
 
-`update` preserves the recorded installation engine and the same LumeniteFX, D3D9, OpenGL, and Vulkan choices. RenoDX is the supported engine in this release. Update eligibility compares the installed Enabler version with the running CLI; it does not check upstream component versions when those Enabler versions match. Use `--reinstall` to resolve and reapply components with the current CLI, and add `--force-download` to bypass caches. `--force-download` alone does not bypass the version check. A game installed by a newer CLI is never downgraded.
+`update` preserves the recorded engine and its typed options. Pass `--engine optiscaler --optiscaler-archive PATH` to migrate a compatible RenoDX installation explicitly. Later OptiScaler updates reuse the cached archive only when its hash matches the recorded revision. Passing an engine explicitly reapplies or switches the strategy; an ordinary update never changes it silently. Use `--reinstall` to reapply the saved strategy, and add `--force-download` to bypass downloadable component caches. A game installed by a newer CLI is never downgraded.
 
-Installation records use schema 3. Older supported records migrate in memory through each schema version, and successful installation or update saves the current schema. Inspecting a game does not rewrite its record. Unknown future schemas, malformed records, and unknown engines are rejected and preserved.
+Installation records use schema 4. `strategy_options.kind` records whether RenoDX/ReShade or OptiScaler owns the installation, along with the strategy-specific options and OptiScaler source revision. Older supported records migrate in memory through each schema version, and successful installation or update saves the current schema. Inspecting a game does not rewrite its record. Unknown future schemas, malformed records, and unknown engines are rejected and preserved.
 
 If recovery cannot finish, the command reports incomplete recovery and retains a snapshot directory containing `recovery.json` and saved files. Keep that directory for recovery. A separate cleanup warning means installation committed successfully but a temporary staging or recovery directory could not be removed.
 
@@ -225,7 +235,7 @@ dlss5-enabler version --check
 
 ## Installation pipeline
 
-The RenoDX pipeline separates target analysis, component selection, preparation, and game mutations:
+Each engine has a separate typed pipeline. The RenoDX pipeline separates target analysis, component selection, preparation, and game mutations:
 
 1. Validate the executable and collect architecture, API hints, and native DLSS evidence.
 2. Select the RenoDX components and proxy.
@@ -244,11 +254,13 @@ The RenoDX pipeline separates target analysis, component selection, preparation,
 
 ReShade installation extracts the official package without executing its setup program. File placement and configuration changes go through the Enabler transaction. Critical finalization completes before recovery snapshots are discarded.
 
+The OptiScaler pipeline validates Windows, x64, native DLSS, DirectX 11/12 evidence, the exact local archive hash, every archive path, final destination collisions, and the NVIDIA NR runtime before removing an existing installation. Its initial profile disables frame generation, ReShade/Special K loading, automatic capture, non-DLSS inputs, and upstream update checks. The overlay key is Delete. Existing `dlssnr-capture` paths are refused because this fork can delete that directory internally.
+
 New installations record created directories and runtime artifacts, including preexisting files that cleanup must preserve. Older records lack some of that ownership information, so untracked legacy logs, screenshots, or empty directories are preserved. Legacy INI entries without whole-file backups can restore only their recorded values; schema migration cannot reconstruct original bytes that were never saved.
 
 ## Upstream fallback policy
 
-The wheel contains `dlss5_enabler/upstreams.json`, which pins a known-compatible fallback for every downloaded component. A normal installation still tries the newest upstream revision first. The candidate is downloaded to an isolated temporary file and checked for HTTPS provenance, size or digest when published, archive safety, required contents, supported layout, and architecture before entering the cache.
+The wheel contains `dlss5_enabler/upstreams.json`, which pins a known-compatible fallback for every downloaded component. A normal RenoDX installation still tries the newest upstream revision first. The OptiScaler fork has no published release asset, so it is accepted only from an explicitly supplied local ZIP with the supported SHA-256 and then stored in a hash-addressed local cache. Candidates are checked for provenance, size or digest, archive safety, required contents, supported layout, and architecture before entering the cache.
 
 When the latest revision cannot be discovered, downloaded, or validated, the CLI emits an `UPSTREAM_*` warning and tries the pinned fallback. A fallback is accepted only when its exact SHA-256 and content policy match the embedded manifest. The successful installation summary lists every fallback used. If both candidates fail, the command stops without cleaning an existing installation or modifying the game.
 

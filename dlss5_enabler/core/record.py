@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import gettempdir
-from typing import Any, cast
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -103,6 +103,56 @@ class InstallOptions(BaseModel):
     vulkan_layer: bool = False
 
 
+class RenoDxStrategyOptions(InstallOptions):
+    kind: Literal["renodx"] = "renodx"
+
+    @classmethod
+    def from_install_options(cls, options: InstallOptions) -> "RenoDxStrategyOptions":
+        return cls(
+            lumenite=options.lumenite, d3d9=options.d3d9, opengl=options.opengl, vulkan_layer=options.vulkan_layer
+        )
+
+    def as_install_options(self) -> InstallOptions:
+        return InstallOptions(
+            lumenite=self.lumenite, d3d9=self.d3d9, opengl=self.opengl, vulkan_layer=self.vulkan_layer
+        )
+
+
+class OptiScalerStrategyOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["optiscaler"] = "optiscaler"
+    variant: Literal["y4my4my4m-v3"] = "y4my4my4m-v3"
+    proxy_name: str
+    nr_passes: int = Field(default=1, ge=1, le=5, strict=True)
+    source_revision: str = Field(min_length=1)
+
+    @field_validator("proxy_name")
+    @classmethod
+    def validate_proxy_name(cls, value: str) -> str:
+        if value not in {
+            "dxgi.dll",
+            "winmm.dll",
+            "d3d12.dll",
+            "dbghelp.dll",
+            "version.dll",
+            "wininet.dll",
+            "winhttp.dll",
+        }:
+            raise ValueError("Unsupported OptiScaler proxy filename")
+        return value
+
+    @field_validator("source_revision")
+    @classmethod
+    def validate_source_revision(cls, value: str) -> str:
+        if not value.strip() or value != value.strip():
+            raise ValueError("OptiScaler source_revision must be nonempty and have no surrounding whitespace")
+        return value
+
+
+StrategyOptions = Annotated[RenoDxStrategyOptions | OptiScalerStrategyOptions, Field(discriminator="kind")]
+
+
 class InstallRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -128,6 +178,7 @@ class InstallRecord(BaseModel):
     lumenite_installed: bool = True
     native_dlss_detected: bool = False
     install_options: InstallOptions = Field(default_factory=InstallOptions)
+    strategy_options: StrategyOptions = Field(default_factory=RenoDxStrategyOptions)
     platform: str = "windows"
     proton_prefix: str = ""
     binaries: dict[str, BinaryInfo] = Field(default_factory=lambda: cast(dict[str, BinaryInfo], {}))
@@ -142,12 +193,31 @@ class InstallRecord(BaseModel):
     def migrate_schema(cls, value: Any) -> Any:
         if not isinstance(value, dict):
             return value
-        migrated = migrations.migrate_record(cast(dict[str, object], value))
+        data = dict(cast(dict[str, object], value))
+        options = data.get("install_options")
+        if isinstance(options, InstallOptions):
+            data["install_options"] = options.model_dump()
+        migrated = migrations.migrate_record(data)
         if "strategy" not in migrated:
             raise ValueError(f"Install record schema {CURRENT_RECORD_SCHEMA_VERSION} requires an explicit strategy")
-        if "install_options" not in migrated:
+        if "install_options" not in migrated and migrated["strategy"] != InstallStrategy.OPTISCALER:
             raise ValueError(f"Install record schema {CURRENT_RECORD_SCHEMA_VERSION} requires explicit install_options")
+        if "strategy_options" not in migrated:
+            raise ValueError(
+                f"Install record schema {CURRENT_RECORD_SCHEMA_VERSION} requires explicit strategy_options"
+            )
         return migrated
+
+    @model_validator(mode="after")
+    def validate_strategy_options(self) -> "InstallRecord":
+        if self.strategy.value != self.strategy_options.kind:
+            raise ValueError("Install record strategy does not match strategy_options.kind")
+        if (
+            isinstance(self.strategy_options, RenoDxStrategyOptions)
+            and self.install_options != self.strategy_options.as_install_options()
+        ):
+            raise ValueError("RenoDX strategy_options must match legacy install_options")
+        return self
 
     @field_validator("game_exe", "game_dir", "reshade_dir", "proton_prefix", mode="before")
     @classmethod
