@@ -122,7 +122,7 @@ class OptiScalerStrategyOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: Literal["optiscaler"] = "optiscaler"
-    variant: Literal["y4my4my4m-v3"] = "y4my4my4m-v3"
+    variant: Literal["y4my4my4m-v3", "y4my4my4m-v4"] = "y4my4my4m-v4"
     proxy_name: str
     nr_passes: int = Field(default=1, ge=1, le=5, strict=True)
     source_revision: str = Field(min_length=1)

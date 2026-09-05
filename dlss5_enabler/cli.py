@@ -139,6 +139,32 @@ def _show_activation_guide(record: InstallRecord | None, lumenite: bool) -> None
     _show_reshade_activation_guide(lumenite, record.native_dlss_detected if record is not None else False)
 
 
+def _proton_override_names(record: InstallRecord) -> list[str]:
+    if record.strategy is InstallStrategy.OPTISCALER and isinstance(record.strategy_options, OptiScalerStrategyOptions):
+        return [record.strategy_options.proxy_name]
+    options = record.install_options
+    if options.d3d9:
+        return ["d3d9"]
+    if options.opengl:
+        return ["opengl32"]
+    return ["dxgi"]
+
+
+def _show_proton_activation_guide(record: InstallRecord | None) -> None:
+    if record is None or not record.proton_prefix:
+        return
+    launch_options = ProtonManager.get_launch_options(_proton_override_names(record))
+    console.print(
+        Panel.fit(
+            "[bold green]Steam / Proton Integration Active[/bold green]\n"
+            f"Proton Prefix: [cyan]{record.proton_prefix}[/cyan]\n"
+            "Copy this into [bold]Steam > Properties > Launch Options[/bold]:\n"
+            f"[bold yellow]{launch_options}[/bold yellow]",
+            border_style="green",
+        )
+    )
+
+
 def _path_size(path: Path) -> int:
     if path.is_file():
         return path.stat().st_size
@@ -273,12 +299,11 @@ def install_cmd(
         typer.Option(
             "--optiscaler-proxy",
             help=(
-                "OptiScaler only: proxy DLL filename "
-                "(keep the default unless the game requires another supported proxy)"
+                "OptiScaler only: proxy DLL filename (auto selects the compatible proxy, such as winmm.dll or dxgi.dll)"
             ),
             rich_help_panel="OptiScaler options",
         ),
-    ] = "dxgi.dll",
+    ] = "auto",
     frame_generation: Annotated[
         FrameGenerationMode,
         typer.Option(
@@ -347,7 +372,7 @@ def install_cmd(
     if engine is InstallStrategy.RENODX and (
         optiscaler_archive is not None
         or nr_passes != 1
-        or optiscaler_proxy != "dxgi.dll"
+        or optiscaler_proxy != "auto"
         or frame_generation is not FrameGenerationMode.AUTO
         or fg_multiplier != 2
         or nr_placement is not NrPlacement.AFTER
@@ -415,20 +440,7 @@ def install_cmd(
         raise typer.Exit(code=1)
 
     rec = record_load(exe.parent)
-    effective_d3d9 = rec.install_options.d3d9 if rec is not None else d3d9 is True
-    if rec and rec.proton_prefix:
-        pfx_info = rec.proton_prefix
-        launch_opts = ProtonManager.get_launch_options(
-            ["d3d9" if effective_d3d9 else ("opengl32" if opengl else "dxgi")]
-        )
-        console.print(
-            Panel.fit(
-                f"[bold green]Steam / Proton Integration Active[/bold green]\n"
-                f"Proton Prefix: [cyan]{pfx_info}[/cyan]\n"
-                f"Steam Launch Options: [bold yellow]{launch_opts}[/bold yellow]",
-                border_style="green",
-            )
-        )
+    _show_proton_activation_guide(rec)
     _show_activation_guide(rec, lumenite)
 
 
@@ -601,8 +613,9 @@ def update_cmd(
     console.print(f"[bold {style}]{result.message}[/bold {style}]")
     if not result.success:
         raise typer.Exit(code=1)
+    record = record_load(resolved_target.parent if resolved_target.is_file() else resolved_target)
+    _show_proton_activation_guide(record)
     if result.status in {GameUpdateStatus.UPDATED, GameUpdateStatus.REINSTALLED}:
-        record = record_load(resolved_target.parent if resolved_target.is_file() else resolved_target)
         _show_activation_guide(record, result.options.lumenite if result.options is not None else True)
 
 
@@ -801,6 +814,7 @@ def info_cmd(
         table.add_row("Install Date", rec.timestamp[:19].replace("T", " "))
         if rec.proton_prefix:
             table.add_row("Proton Prefix", rec.proton_prefix)
+            table.add_row("Steam Launch Options", ProtonManager.get_launch_options(_proton_override_names(rec)))
         if rec.registry_touched:
             overrides_summary = ", ".join(t.value_name for t in rec.registry_touched)
             table.add_row("Wine DLL Overrides", overrides_summary)

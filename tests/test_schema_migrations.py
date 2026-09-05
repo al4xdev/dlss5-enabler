@@ -373,7 +373,7 @@ def test_optiscaler_accepts_supported_pass_bounds(passes: int) -> None:
     options = OptiScalerStrategyOptions(proxy_name="winmm.dll", source_revision="b" * 64, nr_passes=passes)
 
     assert options.nr_passes == passes
-    assert options.variant == "y4my4my4m-v3"
+    assert options.variant == "y4my4my4m-v4"
 
 
 @pytest.mark.parametrize("revision", [None, "", " ", "\t", " hash", "hash\n"])

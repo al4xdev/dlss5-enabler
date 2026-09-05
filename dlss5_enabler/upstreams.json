@@ -7,7 +7,10 @@
       "artifact_kind": "zip",
       "discovery": {
         "kind": "latest_release",
-        "asset_patterns": ["DLSS5-Feeder-*.zip", "DLSS5-Feeder.zip"]
+        "asset_patterns": [
+          "DLSS5-Feeder-*.zip",
+          "DLSS5-Feeder.zip"
+        ]
       },
       "stable_artifacts": [
         {
@@ -38,8 +41,12 @@
             "*dlss5-feed-host64.exe"
           ],
           "architecture_members": {
-            "x86": ["layer-x86/*"],
-            "x64": ["layer-x64/*"]
+            "x86": [
+              "layer-x86/*"
+            ],
+            "x64": [
+              "layer-x64/*"
+            ]
           }
         }
       ]
@@ -50,7 +57,9 @@
       "artifact_kind": "zip",
       "discovery": {
         "kind": "release_list",
-        "asset_patterns": ["*.zip"],
+        "asset_patterns": [
+          "*.zip"
+        ],
         "release_tag_prefix": "renodx-dlss5-"
       },
       "stable_artifacts": [
@@ -64,7 +73,9 @@
       "formats": [
         {
           "version": 1,
-          "required_members": ["*renodx-dlss5.addon64"]
+          "required_members": [
+            "*renodx-dlss5.addon64"
+          ]
         }
       ]
     },
@@ -93,7 +104,9 @@
       "artifact_kind": "zip",
       "discovery": {
         "kind": "release_list",
-        "asset_patterns": ["nvngx_dlssnr_*.zip"],
+        "asset_patterns": [
+          "nvngx_dlssnr_*.zip"
+        ],
         "release_tag_prefix": "dlssnr-"
       },
       "stable_artifacts": [
@@ -107,7 +120,9 @@
       "formats": [
         {
           "version": 1,
-          "required_members": ["*nvngx_dlssnr.dll"]
+          "required_members": [
+            "*nvngx_dlssnr.dll"
+          ]
         }
       ]
     },
@@ -117,7 +132,9 @@
       "artifact_kind": "zip",
       "discovery": {
         "kind": "release_list",
-        "asset_patterns": ["nvngx_dlss_*.zip"],
+        "asset_patterns": [
+          "nvngx_dlss_*.zip"
+        ],
         "release_tag_prefix": "dlss-"
       },
       "stable_artifacts": [
@@ -131,7 +148,9 @@
       "formats": [
         {
           "version": 1,
-          "required_members": ["*nvngx_dlss.dll"]
+          "required_members": [
+            "*nvngx_dlss.dll"
+          ]
         }
       ]
     },
@@ -141,7 +160,9 @@
       "artifact_kind": "zip",
       "discovery": {
         "kind": "release_list",
-        "asset_patterns": ["nvngx_dlssg_*.zip"],
+        "asset_patterns": [
+          "nvngx_dlssg_*.zip"
+        ],
         "release_tag_prefix": "dlssg-"
       },
       "stable_artifacts": [
@@ -156,7 +177,9 @@
       "formats": [
         {
           "version": 1,
-          "required_members": ["*nvngx_dlssg.dll"]
+          "required_members": [
+            "*nvngx_dlssg.dll"
+          ]
         }
       ]
     },
@@ -167,7 +190,11 @@
       "discovery": {
         "kind": "repository_file",
         "branch": "slim",
-        "relative_paths": ["Shaders/ReShade.fxh", "Shaders/ReShadeUI.fxh", "Shaders/DrawText.fxh"]
+        "relative_paths": [
+          "Shaders/ReShade.fxh",
+          "Shaders/ReShadeUI.fxh",
+          "Shaders/DrawText.fxh"
+        ]
       },
       "stable_artifacts": [
         {
@@ -224,7 +251,9 @@
       "artifact_kind": "zip",
       "discovery": {
         "kind": "latest_release",
-        "asset_patterns": ["dgVoodoo2_*.zip"]
+        "asset_patterns": [
+          "dgVoodoo2_*.zip"
+        ]
       },
       "stable_artifacts": [
         {
@@ -237,10 +266,17 @@
       "formats": [
         {
           "version": 1,
-          "required_members": ["dgVoodoo.conf", "dgVoodooCpl.exe"],
+          "required_members": [
+            "dgVoodoo.conf",
+            "dgVoodooCpl.exe"
+          ],
           "architecture_members": {
-            "x86": ["MS/x86/D3D9.dll"],
-            "x64": ["MS/x64/D3D9.dll"]
+            "x86": [
+              "MS/x86/D3D9.dll"
+            ],
+            "x64": [
+              "MS/x64/D3D9.dll"
+            ]
           }
         }
       ]
@@ -259,6 +295,39 @@
           "name": "ReShade_Setup_6.8.0_Addon.exe",
           "url": "https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe",
           "sha256": "afe4c8f13048306307983b8b3d41d5bf00a86820440b0e57dea10950e1176445"
+        }
+      ]
+    },
+    "optiscaler": {
+      "provider": "github",
+      "repository": "y4my4my4m/OptiScaler_DLSSNR_Multipass_MFG",
+      "artifact_kind": "7z",
+      "discovery": {
+        "kind": "latest_release",
+        "asset_patterns": [
+          "OptiScaler_*_with_DLSS.7z"
+        ]
+      },
+      "stable_artifacts": [
+        {
+          "revision": "v10.0.0-dev-fork-y4my4my4m-v4",
+          "name": "OptiScaler_v10.0.0-dev-fork-y4my4my4m-v4_20260905_with_DLSS.7z",
+          "url": "https://github.com/y4my4my4m/OptiScaler_DLSSNR_Multipass_MFG/releases/download/v10.0.0-dev-fork-y4my4my4m-v4/OptiScaler_v10.0.0-dev-fork-y4my4my4m-v4_20260905_with_DLSS.7z",
+          "sha256": "9d7824cc9cfb15265bc6438b4638aad74ff9cd6d1d3488ab73724affb386a8b0",
+          "size_bytes": 117366545
+        }
+      ],
+      "formats": [
+        {
+          "version": 1,
+          "required_members": [
+            "OptiScaler.dll",
+            "OptiScaler.ini",
+            "nvngx.dll_dlssnr.dll",
+            "OptiScaler/nvngx_dlss.dll",
+            "OptiScaler/nvngx_dlssg.dll",
+            "OptiScaler/streamline/sl.interposer.dll"
+          ]
         }
       ]
     }

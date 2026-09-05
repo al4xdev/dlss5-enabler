@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import urlparse
 
+import py7zr
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from dlss5_enabler.core.archive import safe_archive_destination
@@ -161,6 +162,8 @@ class ArtifactValidator:
         recognized_format: int | None = None
         if policy.artifact_kind is ArtifactKind.ZIP:
             recognized_format = self._validate_zip(path, policy, architecture)
+        elif policy.artifact_kind is ArtifactKind.SEVEN_Z:
+            recognized_format = self._validate_7z(path, policy, architecture)
         elif policy.artifact_kind is ArtifactKind.JSON:
             self._validate_json(path)
             if policy.repository == "RankFTW/RHI":
@@ -255,6 +258,81 @@ class ArtifactValidator:
                             f"archive members collide when flattened: {Path(member).name}",
                         )
                     flattened.add(name)
+                return archive_format.version
+        expected = sorted(
+            {
+                pattern
+                for archive_format in policy.formats
+                for pattern in (
+                    archive_format.required_members
+                    + (() if architecture is None else archive_format.architecture_members.get(architecture, ()))
+                )
+            }
+        )
+        raise ArtifactResolutionError(
+            ResolutionWarningCode.CONTENT_MISSING,
+            f"archive does not match a supported layout; expected: {', '.join(expected)}",
+        )
+
+    @staticmethod
+    def _validate_7z(path: Path, policy: ComponentPolicy, architecture: str | None) -> int:
+        if architecture is not None and architecture not in {"x86", "x64"}:
+            raise ArtifactResolutionError(
+                ResolutionWarningCode.FORMAT_UNSUPPORTED,
+                f"unsupported archive architecture: {architecture}",
+            )
+        try:
+            with py7zr.SevenZipFile(path, "r") as archive:
+                needs_password = archive.needs_password()
+                infos = tuple(archive.list())
+                invalid_member = archive.testzip()
+        except ArtifactResolutionError:
+            raise
+        except (OSError, py7zr.Bad7zFile, RuntimeError) as error:
+            raise ArtifactResolutionError(
+                ResolutionWarningCode.FORMAT_UNSUPPORTED,
+                f"artifact is not a readable 7z archive: {error}",
+            ) from error
+        if needs_password:
+            raise ArtifactResolutionError(
+                ResolutionWarningCode.FORMAT_UNSUPPORTED,
+                "encrypted 7z archives are unsupported",
+            )
+        if invalid_member is not None:
+            raise ArtifactResolutionError(
+                ResolutionWarningCode.FORMAT_UNSUPPORTED,
+                f"archive member failed its CRC check: {invalid_member}",
+            )
+        members = tuple(info.filename.replace("\\", "/") for info in infos if not info.is_directory)
+        validation_root = path.parent / f".{path.name}.validation"
+        normalized_members: set[str] = set()
+        for info in infos:
+            member = info.filename.replace("\\", "/")
+            if info.is_symlink:
+                raise ArtifactResolutionError(
+                    ResolutionWarningCode.ARCHIVE_UNSAFE,
+                    f"archive contains a symbolic link: {member}",
+                )
+            try:
+                safe_archive_destination(validation_root, member)
+            except ValueError as error:
+                raise ArtifactResolutionError(ResolutionWarningCode.ARCHIVE_UNSAFE, str(error)) from error
+            normalized = member.casefold()
+            if normalized in normalized_members:
+                raise ArtifactResolutionError(
+                    ResolutionWarningCode.ARCHIVE_UNSAFE,
+                    f"archive contains colliding member paths: {member}",
+                )
+            normalized_members.add(normalized)
+        return ArtifactValidator._match_archive_format(members, policy, architecture)
+
+    @staticmethod
+    def _match_archive_format(members: tuple[str, ...], policy: ComponentPolicy, architecture: str | None) -> int:
+        for archive_format in sorted(policy.formats, key=lambda item: item.version, reverse=True):
+            required = archive_format.required_members
+            if architecture is not None:
+                required += archive_format.architecture_members.get(architecture, ())
+            if all(any(fnmatch(member.lower(), pattern.lower()) for member in members) for pattern in required):
                 return archive_format.version
         expected = sorted(
             {
@@ -401,8 +479,8 @@ class UpstreamResolver:
         if (
             not matched
             and len(candidates) == 1
-            and policy.artifact_kind is ArtifactKind.ZIP
-            and candidates[0].name.lower().endswith(".zip")
+            and policy.artifact_kind in {ArtifactKind.ZIP, ArtifactKind.SEVEN_Z}
+            and candidates[0].name.lower().endswith((".zip", ".7z"))
         ):
             return candidates[0]
         published = ", ".join(candidate.name for candidate in candidates) or "none"

@@ -7,10 +7,18 @@ from typer.testing import CliRunner
 
 from dlss5_enabler.cli import app
 from dlss5_enabler.core.pe import PeArch
-from dlss5_enabler.core.record import BinaryInfo, IndexEntry, InstallOptions, InstallRecord
+from dlss5_enabler.core.record import (
+    CURRENT_RECORD_SCHEMA_VERSION,
+    BinaryInfo,
+    IndexEntry,
+    InstallOptions,
+    InstallRecord,
+    OptiScalerStrategyOptions,
+)
 from dlss5_enabler.network.update_check import UpdateCheckResult
 from dlss5_enabler.operations.update import GameUpdateResult, GameUpdateStatus
 from dlss5_enabler.platform.proton import SteamPrefixInfo
+from dlss5_enabler.schemas.strategy import InstallStrategy
 
 runner = CliRunner()
 
@@ -357,6 +365,30 @@ def test_cli_info_proton(tmp_path: Path, mocker: MockerFixture) -> None:
     assert "WINEDLLOVERRIDES" in res.stdout
 
 
+def test_cli_info_managed_optiscaler_proton_uses_persisted_proxy(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    record = InstallRecord(
+        schema_version=CURRENT_RECORD_SCHEMA_VERSION,
+        game_exe=str(game_exe),
+        game_dir=str(tmp_path),
+        proton_prefix=str(tmp_path / "pfx"),
+        strategy=InstallStrategy.OPTISCALER,
+        install_options=InstallOptions(),
+        strategy_options=OptiScalerStrategyOptions(proxy_name="winhttp.dll", source_revision="f" * 64),
+    )
+    mocker.patch("dlss5_enabler.cli.detect_pe_arch", return_value=PeArch.X64)
+    mocker.patch("dlss5_enabler.cli.file_is_writable", return_value=True)
+    mocker.patch("dlss5_enabler.cli.record_load", return_value=record)
+
+    result = runner.invoke(app, ["info", str(game_exe)])
+
+    assert result.exit_code == 0
+    assert "Steam Launch Options" in result.stdout
+    assert 'WINEDLLOVERRIDES="winhttp=n,b" %command%' in result.stdout
+    assert 'WINEDLLOVERRIDES="dxgi=n,b" %command%' not in result.stdout
+
+
 def test_cli_install_proton_output(tmp_path: Path, mocker: MockerFixture) -> None:
     game_exe = tmp_path / "game.exe"
     game_exe.write_bytes(b"MZ")
@@ -374,7 +406,49 @@ def test_cli_install_proton_output(tmp_path: Path, mocker: MockerFixture) -> Non
     res = runner.invoke(app, ["install", str(game_exe)])
     assert res.exit_code == 0
     assert "Steam / Proton Integration Active" in res.stdout
-    assert "WINEDLLOVERRIDES" in res.stdout
+    assert 'WINEDLLOVERRIDES="dxgi=n,b" %command%' in res.stdout
+    assert "Steam > Properties > Launch Options" in res.stdout
+
+
+def test_cli_install_proton_uses_persisted_optiscaler_proxy(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    record = InstallRecord(
+        schema_version=CURRENT_RECORD_SCHEMA_VERSION,
+        game_exe=str(game_exe),
+        game_dir=str(tmp_path),
+        proton_prefix=str(tmp_path / "pfx"),
+        strategy=InstallStrategy.OPTISCALER,
+        install_options=InstallOptions(),
+        strategy_options=OptiScalerStrategyOptions(proxy_name="winmm.dll", source_revision="f" * 64),
+    )
+    mocker.patch("dlss5_enabler.cli.run_install", return_value=True)
+    mocker.patch("dlss5_enabler.cli.record_load", return_value=record)
+
+    result = runner.invoke(app, ["install", str(game_exe), "--engine", "optiscaler"])
+
+    assert result.exit_code == 0
+    assert 'WINEDLLOVERRIDES="winmm=n,b" %command%' in result.stdout
+    assert 'WINEDLLOVERRIDES="dxgi=n,b" %command%' not in result.stdout
+
+
+def test_cli_install_proton_keeps_renodx_override_selection(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    record = InstallRecord(
+        game_exe=str(game_exe),
+        game_dir=str(tmp_path),
+        proton_prefix=str(tmp_path / "pfx"),
+        install_options=InstallOptions(d3d9=True),
+    )
+    mocker.patch("dlss5_enabler.cli.run_install", return_value=True)
+    mocker.patch("dlss5_enabler.cli.record_load", return_value=record)
+
+    result = runner.invoke(app, ["install", str(game_exe)])
+
+    assert result.exit_code == 0
+    assert 'WINEDLLOVERRIDES="d3d9=n,b" %command%' in result.stdout
+    assert "winmm=n,b" not in result.stdout
 
 
 def test_cli_does_not_announce_proton_without_prefix(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -525,6 +599,31 @@ def test_cli_update_resolves_unique_managed_executable_name(tmp_path: Path, mock
 
     assert result.exit_code == 0
     assert update.call_args.args[0] == game_exe
+
+
+def test_cli_update_proton_uses_persisted_optiscaler_proxy(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    record = InstallRecord(
+        schema_version=CURRENT_RECORD_SCHEMA_VERSION,
+        game_exe=str(game_exe),
+        game_dir=str(tmp_path),
+        proton_prefix=str(tmp_path / "pfx"),
+        strategy=InstallStrategy.OPTISCALER,
+        install_options=InstallOptions(),
+        strategy_options=OptiScalerStrategyOptions(proxy_name="version.dll", source_revision="f" * 64),
+    )
+    mocker.patch(
+        "dlss5_enabler.cli.run_update",
+        return_value=GameUpdateResult(GameUpdateStatus.UPDATED, "Updated successfully."),
+    )
+    mocker.patch("dlss5_enabler.cli.record_load", return_value=record)
+
+    result = runner.invoke(app, ["update", str(game_exe)])
+
+    assert result.exit_code == 0
+    assert 'WINEDLLOVERRIDES="version=n,b" %command%' in result.stdout
+    assert 'WINEDLLOVERRIDES="dxgi=n,b" %command%' not in result.stdout
 
 
 def test_cli_update_failure_has_nonzero_exit(tmp_path: Path, mocker: MockerFixture) -> None:

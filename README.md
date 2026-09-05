@@ -1,6 +1,6 @@
 # DLSS5 Enabler
 
-Transactional command-line installer for managing RenoDX/Feeder and OptiScaler Neural Rendering strategies in Windows games.
+Transactional command-line installer for managing RenoDX/Feeder and OptiScaler Neural Rendering strategies for Windows game executables on Windows and experimental Linux / Proton.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![CI](https://github.com/al4xdev/dlss5-enabler/actions/workflows/ci.yml/badge.svg)](https://github.com/al4xdev/dlss5-enabler/actions/workflows/ci.yml)
@@ -10,9 +10,9 @@ Transactional command-line installer for managing RenoDX/Feeder and OptiScaler N
 DLSS5 Enabler automates setups that would otherwise require manually coordinating several upstream projects, selecting the correct binaries, configuring a proxy, and preserving enough state to undo every change later. It offers two independent strategies:
 
 - **RenoDX/ReShade** is the general path for Windows and experimental Linux / SteamOS. It also covers the optional DirectX 9, OpenGL, and Vulkan integrations.
-- **OptiScaler** is the focused path for native-DLSS x64 games on Windows using DirectX 11 or 12. It provides direct access to DLSS Neural Rendering multipass and experimental frame-generation routing with a smaller game-side stack.
+- **OptiScaler** is the focused path for native-DLSS x64 games using DirectX 11 or 12 on Windows, plus initial DirectX 12 support through Linux / Proton. It provides direct access to DLSS Neural Rendering multipass and experimental frame-generation routing with a smaller game-side stack.
 
-OptiScaler currently uses the pinned y4my4my4m DLSSNR Multipass v3 package because that is the validated package available for this integration. The installer keeps the strategy boundary explicit, so a future compatible and better-maintained project can replace that upstream without changing the install, update, switch, and uninstall model. Such a replacement would still require its own validation and release.
+OptiScaler currently uses the official y4my4my4m DLSSNR Multipass V4 release. The CLI discovers the release asset ending in `_with_DLSS.7z`, validates it against the pinned SHA-256, and caches it automatically. A local supported archive remains optional. The installer keeps the strategy boundary explicit, so a future compatible and better-maintained project can replace that upstream without changing the install, update, switch, and uninstall model. Such a replacement would still require its own validation and release.
 
 It combines:
 
@@ -71,7 +71,7 @@ These protections reduce the chance of a broken game directory, but they cannot 
 | Strategy | Choose it when | Current advantages | Current limits |
 | --- | --- | --- | --- |
 | RenoDX/ReShade | You want the broadest supported route, or need DirectX 9, OpenGL, Vulkan, Wine, Proton, or SteamOS support | Broader platform and graphics-API coverage; automatic upstream discovery; optional LumeniteFX | More components participate in the game-side stack |
-| OptiScaler | The game is Windows x64, uses DirectX 11/12, and already has native DLSS | Direct DLSS Neural Rendering multipass controls; experimental frame-generation routing; no ReShade/Feeder composition in this strategy | Windows only; requires native DLSS and the exact validated local archive; game compatibility varies |
+| OptiScaler | The x64 game already has native DLSS and uses DirectX 11/12 on Windows, or DirectX 12 through Linux / Proton | Automatic validated V4 acquisition; direct DLSS Neural Rendering multipass controls; experimental frame-generation routing; no ReShade/Feeder composition in this strategy | Linux / Proton support is initial and DX12-only; game compatibility varies |
 
 Choosing OptiScaler does not make a non-DLSS game compatible. Native DLSS is the temporal input required by this initial integration. Frame generation is a separate experimental output and does not need to be native to the game when the selected OptiScaler route can provide it.
 
@@ -81,6 +81,7 @@ Choosing OptiScaler does not make a non-DLSS game compatible. Native DLSS is the
 | --- | --- | --- |
 | DirectX 11 / 12 | Default | ReShade `dxgi.dll` |
 | Native DLSS on Windows x64 DirectX 11 / 12 | `--engine optiscaler` | Validated OptiScaler proxy, default `dxgi.dll` |
+| Native DLSS on Linux / Proton x64 DirectX 12 | `--engine optiscaler` | Validated OptiScaler proxy plus a transactional Wine DLL override |
 | DirectX 9 | automatic, or `--d3d9` | dgVoodoo2 translation plus the 64-bit feeder host when required |
 | OpenGL | `--opengl` | ReShade `opengl32.dll` |
 | Vulkan | `--vulkan-layer` | Feeder Vulkan-layer fallback when available upstream |
@@ -93,7 +94,7 @@ These are implemented installer paths, not claims of universal compatibility wit
 | Environment | Role |
 | --- | --- |
 | Windows | Runs the CLI and manages a native Windows game executable |
-| Experimental Linux / SteamOS | Runs the CLI and manages a Windows game executable through Wine or Proton |
+| Experimental Linux / SteamOS | Runs the CLI and manages a Windows game executable through Wine or Proton; OptiScaler is initially limited to DX12 |
 | macOS | Runs portability, packaging, and synthetic-artifact checks in CI only |
 
 The installation target must be a Windows PE executable. Native Linux ELF binaries are inspected for diagnostics but are rejected as installation targets, and the project does not claim a native macOS DLSS runtime.
@@ -105,7 +106,7 @@ The installation target must be a Windows PE executable. Native Linux ELF binari
 - An NVIDIA RTX GPU supported by the downloaded NGX runtime
 - A game installation you can write to
 - Internet access for the first component download
-- The exact supported y4my4my4m v3 ZIP when first selecting OptiScaler
+- A detectable Wine / Proton prefix when selecting OptiScaler on Linux
 
 ## Quick start
 
@@ -128,10 +129,16 @@ For the general RenoDX/ReShade strategy, install with the default command:
 dlss5-enabler install "C:\Games\Example\game.exe"
 ```
 
-For a compatible native-DLSS x64 DirectX 11/12 game on Windows, select OptiScaler and provide the supported archive the first time:
+For a compatible native-DLSS x64 DirectX 11/12 game on Windows, select OptiScaler. The CLI downloads and validates the supported V4 release automatically:
 
 ```console
-dlss5-enabler install --engine optiscaler --optiscaler-archive "C:\Downloads\OptiScaler_DLSSNR_MultiPass_MFG6X_fix_v3_by_y4my4my4m.zip" "C:\Games\Example\game.exe"
+dlss5-enabler install --engine optiscaler "C:\Games\Example\game.exe"
+```
+
+On Linux / Proton, the initial OptiScaler path accepts native-DLSS x64 DirectX 12 games only. Point to the Windows executable inside the Steam library; the CLI must be able to find its prefix so it can apply and record the proxy DLL override:
+
+```console
+dlss5-enabler install --engine optiscaler "/home/deck/.local/share/Steam/steamapps/common/Example/game.exe"
 ```
 
 After installation, use `info` to review the saved strategy and options, `update` to refresh it, and `uninstall` to restore the recorded original files.
@@ -214,19 +221,19 @@ Options:
 | `--opengl` | Use the OpenGL ReShade hook |
 | `--vulkan-layer` | Request the Vulkan-layer fallback |
 | `--engine renodx` | Use the RenoDX/ReShade strategy; this is the default |
-| `--engine optiscaler` | Use OptiScaler for a supported native-DLSS Windows x64 game |
-| `--optiscaler-archive PATH` | Import the supported y4my4my4m v3 ZIP and cache it by SHA-256 |
+| `--engine optiscaler` | Use OptiScaler for a supported native-DLSS x64 game |
+| `--optiscaler-archive PATH` | Optionally import a supported archive instead of automatic V4 acquisition |
 | `--nr-passes 1..5` | Set the OptiScaler DLSS Neural Rendering pass count |
 | `--nr-placement after|before|inside` | Choose where Neural Rendering runs relative to the upscaler; defaults to `after` |
 | `--frame-generation auto|off|fsr|dlssg` | Select the OptiScaler frame-generation output; defaults to `auto` |
 | `--fg-multiplier 2..6` | Select the experimental DLSS-G multiplier; values above 2 require `--frame-generation dlssg` |
-| `--optiscaler-proxy NAME` | Select a supported proxy filename; defaults to `dxgi.dll` |
+| `--optiscaler-proxy auto|NAME` | Select a proxy filename or use `auto` (default) to detect between `dxgi.dll` and `winmm.dll` |
 | `-f`, `--force-download` | Ignore cached assets and fetch them again |
 | `-v`, `--verbose` | Enable detailed console and file logging |
 
 DirectX 9 translation is automatic when neither override is passed. `--d3d9` forces it, while `--no-d3d9` keeps the direct hook even when D3D9 is detected. `--d3d9` and `--opengl` cannot be combined.
 
-The supported OptiScaler archive is `OptiScaler_DLSSNR_MultiPass_MFG6X_fix_v3_by_y4my4my4m.zip` with SHA-256 `f927b5aed15d09b23f559433d6740834f550d79bb2b75c7315602319819a3096`. The author currently publishes this build outside GitHub releases; the CLI does not invent a download URL or silently replace it with another fork.
+By default, the CLI discovers the official y4my4my4m V4 release and selects its `_with_DLSS.7z` asset. The pinned SHA-256 must match before the archive enters the cache or installation pipeline. `--optiscaler-archive PATH` remains available for an explicitly supplied supported archive. A previously recorded V3 installation can still update from its verified hash-addressed cache entry; the CLI does not silently reinterpret a V3 archive as V4 or substitute another fork.
 
 ### OptiScaler Neural Rendering placement
 
@@ -235,18 +242,26 @@ The default `--nr-placement after` runs Neural Rendering after upscaling at outp
 `--nr-placement before` runs Neural Rendering at the lower internal resolution before the upscaler. This can improve performance. In the manual Control test used for this release, it increased frame rate without a visible quality loss, so it is the first alternative worth trying:
 
 ```console
-dlss5-enabler install --engine optiscaler --optiscaler-archive "C:\Downloads\OptiScaler_DLSSNR_MultiPass_MFG6X_fix_v3_by_y4my4my4m.zip" --nr-placement before "C:\Games\Control\Control_DX12.exe"
+dlss5-enabler install --engine optiscaler --nr-placement before "C:\Games\Control\Control_DX12.exe"
 ```
 
 `--nr-placement inside` lets the OptiScaler pipeline place Neural Rendering inside the upscaling process. It is experimental and can behave differently across games and upstream builds. None of these placement modes guarantees the same performance or image quality in another game, resolution, or driver.
 
-### Experimental frame generation
+#### Experimental frame generation
 
 `--frame-generation auto` is the OptiScaler default. It chooses the FSR frame-generation output for the broadest compatibility, including games that have native DLSS upscaling but no native frame generation. Use `off`, `fsr`, or `dlssg` to make the choice explicit.
 
-The DLSS-G path also applies a GPU-generation profile inside the OptiScaler strategy. RTX 40-series GPUs enable the package's Ada unlock, Ada kernels, and flip-metering compatibility settings. RTX 50-series GPUs disable those Ada overrides and use their native profile. Older or unidentified GPUs are not allowed to select DLSS-G and remain on FSR in `auto` mode. This detection only selects OptiScaler configuration. It does not broaden the current Windows x64 DirectX 11/12 support boundary.
+The DLSS-G path also applies a GPU-generation profile inside the OptiScaler strategy. RTX 40-series GPUs enable the package's Ada unlock, Ada kernels, and flip-metering compatibility settings. RTX 50-series GPUs disable those Ada overrides and use their native profile. Explicit DLSS-G supports both generations with multipliers from 2x through 6x. Older or unidentified GPUs are not allowed to select DLSS-G and remain on FSR in `auto` mode. This detection only selects OptiScaler configuration; it does not expand the supported APIs or environments.
 
 A manual smoke test in Control confirmed that the FSR frame-generation output can work even though Control has no native frame generation. In the same setup, the OptiScaler UI reported that DLSS-G required HDR10 and DLSS-G did not work in Control; changing Control's HDR setting did not make that route usable. This is one experimental observation, not a rule that DLSS-G always requires HDR10 or a promise that FSR frame generation works in every game.
+
+### Real-world performance observations and generation tradeoffs
+
+Manual smoke testing on real hardware revealed key practical insights across modern and older titles:
+
+- **Death Stranding (Decima Engine / RTX 5060 Ti):** Even though Death Stranding has no native frame generation and uses delay-loaded DirectX 12, OptiScaler exposes DLSS-NR and Frame Generation seamlessly using the automatically selected `winmm.dll` proxy. On an RTX 5060 Ti at maximum graphics settings with `--nr-placement inside`, baseline performance sat at approximately 40–50 FPS; enabling Multi-Frame Generation (MFG / DLSSG) scaled this baseline up to 120–140 FPS with exceptional visual reconstruction and stability.
+- **Modern Engines vs Older Titles:** Counterintuitively, modern graphics engines benefit the most from Neural Rendering and Multi-Frame Generation. In a modern title running at ~70 FPS baseline, turning on heavy Neural Rendering may drop base render rate to ~40 FPS, but Multi-Frame Generation then catapults the display rate to 120+ FPS with superior temporal stability. Conversely, older titles running at extreme native framerates (e.g. 4K 200+ FPS) can experience jarring performance penalties (e.g. dropping down to ~30 FPS) if heavy neural passes are forced without sufficient native motion vector granularity.
+- **LogToFile Disabled by Default:** In real-world extended play, OptiScaler's disk logging (`LogToFile=true`) was observed to write tens of megabytes per minute to `OptiScaler.log`, introducing disk I/O overhead and micro-stutter. The installation pipeline now generates `OptiScaler.ini` with `LogToFile=false` by default.
 
 ### Update a managed game
 
@@ -266,7 +281,7 @@ Use `--reinstall` when you want to reapply the same saved strategy even though t
 Switch from RenoDX to OptiScaler explicitly only when the target satisfies the OptiScaler requirements:
 
 ```console
-dlss5-enabler switch "C:\Games\Example\game.exe" optiscaler --optiscaler-archive "C:\Downloads\OptiScaler_DLSSNR_MultiPass_MFG6X_fix_v3_by_y4my4my4m.zip"
+dlss5-enabler switch "C:\Games\Example\game.exe" optiscaler
 ```
 
 Switch back to RenoDX explicitly with:
@@ -275,9 +290,7 @@ Switch back to RenoDX explicitly with:
 dlss5-enabler switch "C:\Games\Example\game.exe" renodx
 ```
 
-The switch is transactional: the CLI stages and validates the selected strategy before replacing the managed installation. Later OptiScaler updates reuse the cached archive only when its hash matches the recorded revision. The older `update GAME --engine ENGINE` form remains compatible, but `switch` makes the intent clearer. An ordinary update never changes strategy silently. A game installed by a newer CLI is never downgraded.
-
-For a saved OptiScaler installation, `--nr-passes`, `--nr-placement`, `--frame-generation`, and `--optiscaler-proxy` override only the named setting during an update. The other recorded options remain unchanged.
+The switch is transactional: the CLI stages and validates the selected strategy before replacing the managed installation. Later OptiScaler updates reuse a cached archive only when its identity matches the recorded or resolved revision. The older `update GAME --engine ENGINE` form remains compatible, but `switch` makes the intent clearer. An ordinary update never changes strategy silently. A game installed by a newer CLI is never downgraded.
 
 Installation records use schema 5. `strategy_options.kind` records whether RenoDX/ReShade or OptiScaler owns the installation, along with the strategy-specific options and OptiScaler source revision. Older supported records migrate in memory through each schema version, and successful installation or update saves the current schema. Inspecting a game does not rewrite its record. Unknown future schemas, malformed records, and unknown engines are rejected and preserved.
 
@@ -342,13 +355,17 @@ Each engine has a separate typed pipeline. The RenoDX pipeline separates target 
 
 ReShade installation extracts the official package without executing its setup program. File placement and configuration changes go through the Enabler transaction. Critical finalization completes before recovery snapshots are discarded.
 
-The OptiScaler pipeline validates Windows, x64, native DLSS, DirectX 11/12 evidence, the exact local archive hash, every archive path, final destination collisions, and the NVIDIA NR runtime before removing an existing installation. Its profile configures the selected NR placement and frame-generation output, disables ReShade/Special K loading, automatic capture, non-DLSS inputs, and upstream update checks. GPU-generation detection affects only the DLSS-G compatibility profile. The overlay key is Delete. Existing `dlssnr-capture` paths are refused because this fork can delete that directory internally.
+The OptiScaler pipeline validates the host and target combination, x64, native DLSS, supported graphics API evidence, the resolved archive hash, every archive path, final destination collisions, and the NVIDIA NR runtime before removing an existing installation. Windows supports DirectX 11 and DirectX 12. The initial Linux / Proton path supports DirectX 12 only and requires a detectable prefix; its proxy override is applied, recorded, rolled back, and uninstalled through the same transaction as the game files. Vulkan and translating DirectX 11 to DirectX 12 under Proton are outside this initial OptiScaler support boundary.
+
+The installed profile configures the selected NR placement and frame-generation output, disables ReShade/Special K loading, automatic capture, non-DLSS inputs, and upstream update checks. `inside` NR placement remains experimental and is not the default. GPU-generation detection affects only the DLSS-G compatibility profile. The overlay key is Delete. Existing `dlssnr-capture` paths are refused because this fork can delete that directory internally.
+
+The V4 upstream reports a successful RTX 4090 Linux / Proton test in RoboCop with Neural Rendering and Multi Frame Generation. DLSS5 Enabler validates its Linux integration with synthetic automated tests in the current Windows development environment; it has not independently reproduced that game test or established a general Linux compatibility claim.
 
 New installations record created directories and runtime artifacts, including preexisting files that cleanup must preserve. Older records lack some of that ownership information, so untracked legacy logs, screenshots, or empty directories are preserved. Legacy INI entries without whole-file backups can restore only their recorded values; schema migration cannot reconstruct original bytes that were never saved.
 
 ## Upstream fallback policy
 
-The wheel contains `dlss5_enabler/upstreams.json`, which pins a known-compatible fallback for every downloaded component. A normal RenoDX installation still tries the newest upstream revision first. The OptiScaler fork has no published release asset, so it is accepted only from an explicitly supplied local ZIP with the supported SHA-256 and then stored in a hash-addressed local cache. Candidates are checked for provenance, size or digest, archive safety, required contents, supported layout, and architecture before entering the cache.
+The wheel contains `dlss5_enabler/upstreams.json`, which pins a known-compatible fallback for every downloaded component. A normal RenoDX installation still tries the newest upstream revision first. OptiScaler resolves the official y4my4my4m V4 `_with_DLSS.7z` release asset and validates it against the pinned SHA-256; a supported local archive can be supplied explicitly. Previously recorded V3 installations retain compatibility with their verified cached archive. Candidates are checked for provenance, size or digest, archive safety, required contents, supported layout, and architecture before entering the cache.
 
 When the latest revision cannot be discovered, downloaded, or validated, the CLI emits an `UPSTREAM_*` warning and tries the pinned fallback. A fallback is accepted only when its exact SHA-256 and content policy match the embedded manifest. The successful installation summary lists every fallback used. If both candidates fail, the command stops without cleaning an existing installation or modifying the game.
 
@@ -410,6 +427,7 @@ flowchart TB
     pe --> selection
     platform_impl --> selection
     proton --> renodx_pipeline
+    proton --> optiscaler_pipeline
 
     subgraph supply["Upstream resolution and supply-chain validation"]
         fetch["Component source functions"] --> provider["DownloadSourceAdapter<br/>provider-neutral contract"]

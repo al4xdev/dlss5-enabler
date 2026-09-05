@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from fnmatch import fnmatch
 from functools import partial
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 from dlss5_enabler.core.archive import safe_archive_destination
@@ -26,6 +27,7 @@ from dlss5_enabler.network.resolver import ArtifactCandidate, ResolutionWarning,
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int], None]
+OptiScalerVariant = Literal["y4my4my4m-v3", "y4my4my4m-v4"]
 
 
 def _version_key(value: str) -> tuple[int, ...]:
@@ -143,8 +145,9 @@ class FeederBundle:
 class OptiScalerBundle:
     def __init__(self) -> None:
         self.archive_path: Path | None = None
-        self.variant: str = ""
+        self.variant: OptiScalerVariant = "y4my4my4m-v4"
         self.source_revision: str = ""
+        self.includes_dlssg: bool = False
         self.binaries: dict[str, BinaryInfo] = {}
         self.warnings: tuple[ResolutionWarning, ...] = ()
 
@@ -164,47 +167,106 @@ def fetch_optiscaler(
     archive_path: Path | None = None,
     source_revision: str = "",
 ) -> OptiScalerBundle:
-    del log, progress, force
-    expected_digest = "f927b5aed15d09b23f559433d6740834f550d79bb2b75c7315602319819a3096"
+    legacy_digest = "f927b5aed15d09b23f559433d6740834f550d79bb2b75c7315602319819a3096"
+    current_digest = "9d7824cc9cfb15265bc6438b4638aad74ff9cd6d1d3488ab73724affb386a8b0"
+    current_revision = "v10.0.0-dev-fork-y4my4my4m-v4"
     out = OptiScalerBundle()
     if archive_path is not None:
         archive = archive_path.expanduser().resolve()
         if not archive.is_file():
             raise FileNotFoundError(f"OptiScaler archive not found: {archive}")
         digest = sha256_file(archive)
-        if digest != expected_digest:
+        variants: dict[str, tuple[OptiScalerVariant, str, str, bool]] = {
+            legacy_digest: ("y4my4my4m-v3", ".zip", legacy_digest, False),
+            current_digest: ("y4my4my4m-v4", ".7z", current_revision, True),
+        }
+        selected = variants.get(digest)
+        if selected is None:
             raise ValueError(f"Unsupported OptiScaler archive SHA-256: {digest}")
-        cache_path = get_cache_dir() / f"OptiScaler-y4my4my4m-v3-{digest}.zip"
+        variant, suffix, revision, includes_dlssg = selected
+        cache_path = get_cache_dir() / f"OptiScaler-{variant}-{digest}{suffix}"
         with resource_lock(cache_path):
             if not cache_path.is_file() or sha256_file(cache_path) != digest:
                 _atomic_copy_file_unlocked(archive, cache_path)
         out.archive_path = cache_path
-        out.variant = "y4my4my4m-v3"
-        out.source_revision = digest
+        out.variant = variant
+        out.source_revision = revision
+        out.includes_dlssg = includes_dlssg
         out.binaries[archive.name] = BinaryInfo(
             name=archive.name,
             version=out.variant,
             sha256=digest,
             size_bytes=archive.stat().st_size,
-            source_revision=digest,
+            source_revision=revision,
         )
         return out
-    revision = source_revision or expected_digest
-    if revision != expected_digest:
-        raise ValueError(f"Unsupported OptiScaler source revision: {revision}")
-    cache_path = get_cache_dir() / f"OptiScaler-y4my4my4m-v3-{revision}.zip"
-    if not cache_path.is_file() or sha256_file(cache_path) != revision:
-        raise FileNotFoundError("The recorded OptiScaler archive is not available in the verified local cache")
-    out.archive_path = cache_path
-    out.variant = "y4my4my4m-v3"
-    out.source_revision = revision
-    out.binaries[cache_path.name] = BinaryInfo(
-        name=cache_path.name,
-        version=out.variant,
-        sha256=revision,
-        size_bytes=cache_path.stat().st_size,
-        source_revision=revision,
+    if source_revision == legacy_digest:
+        cache_path = get_cache_dir() / f"OptiScaler-y4my4my4m-v3-{legacy_digest}.zip"
+        if not cache_path.is_file() or sha256_file(cache_path) != legacy_digest:
+            raise FileNotFoundError("The recorded OptiScaler V3 archive is not available in the verified local cache")
+        out.archive_path = cache_path
+        out.variant = "y4my4my4m-v3"
+        out.source_revision = legacy_digest
+        out.binaries[cache_path.name] = BinaryInfo(
+            name=cache_path.name,
+            version=out.variant,
+            sha256=legacy_digest,
+            size_bytes=cache_path.stat().st_size,
+            source_revision=legacy_digest,
+        )
+        return out
+    if source_revision and source_revision != current_revision:
+        raise ValueError(f"Unsupported OptiScaler source revision: {source_revision}")
+    v4_cache_path = get_cache_dir() / f"OptiScaler-y4my4my4m-v4-{current_digest}.7z"
+    if not force and v4_cache_path.is_file() and sha256_file(v4_cache_path) == current_digest:
+        out.archive_path = v4_cache_path
+        out.variant = "y4my4my4m-v4"
+        out.source_revision = current_revision
+        out.includes_dlssg = True
+        out.binaries[v4_cache_path.name] = BinaryInfo(
+            name=v4_cache_path.name,
+            version=out.variant,
+            sha256=current_digest,
+            size_bytes=v4_cache_path.stat().st_size,
+            source_revision=current_revision,
+        )
+        return out
+    policy = _policy("optiscaler")
+    adapter = _github()
+    repository = policy.repository
+    if repository is None:
+        raise RuntimeError("OptiScaler policy is incomplete")
+
+    def latest() -> Sequence[ArtifactCandidate]:
+        if source_revision:
+            stable = policy.stable_artifacts[0]
+            return (
+                ArtifactCandidate(
+                    provider=policy.provider,
+                    revision=stable.revision,
+                    name=stable.name,
+                    url=stable.url,
+                    sha256=stable.sha256,
+                    size_bytes=stable.size_bytes,
+                    asset_id=stable.asset_id,
+                ),
+            )
+        return _release_candidates(adapter, repository)
+
+    resolved = _resolver(log).resolve(
+        "optiscaler",
+        policy,
+        v4_cache_path,
+        latest,
+        progress=progress,
+        force=force,
     )
+    out.archive_path = resolved.path
+    out.variant = "y4my4my4m-v4"
+    out.source_revision = resolved.revision
+    out.includes_dlssg = True
+    out.warnings = resolved.warnings
+    out.binaries[resolved.name] = _binary(resolved.path, resolved.name, resolved)
     return out
 
 

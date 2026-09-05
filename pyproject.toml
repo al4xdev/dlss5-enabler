@@ -1,6 +1,6 @@
 [project]
 name = "dlss5-enabler"
-version = "1.2.0"
+version = "1.2.1"
 description = "Transactional installer for RenoDX, DLSS5-Feeder, and OptiScaler game rendering upgrades"
 readme = "README.md"
 requires-python = ">=3.10"

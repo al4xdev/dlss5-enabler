@@ -168,7 +168,7 @@ def run_update(
             )
         source_revision = ""
         nr_passes = optiscaler_nr_passes if optiscaler_nr_passes is not None else 1
-        proxy = optiscaler_proxy or "dxgi.dll"
+        proxy = optiscaler_proxy or "auto"
         frame_generation = optiscaler_frame_generation or FrameGenerationMode.AUTO
         fg_multiplier = optiscaler_fg_multiplier if optiscaler_fg_multiplier is not None else 2
         nr_placement = optiscaler_nr_placement or NrPlacement.AFTER

@@ -121,7 +121,7 @@ def http_get_text(url: str, retries: int = 3, headers: dict[str, str] | None = N
                 if remaining <= 0:
                     break
                 time.sleep(min(1.5 * attempt, remaining))
-    remaining = deadline - time.monotonic()
+    remaining = min(METADATA_DEADLINE_SECONDS, deadline - time.monotonic())
     if last_err is not None and _is_retryable(last_err) and remaining > 0:
         fallback = _curl_get_text(url, req_headers, remaining)
         if fallback is not None:

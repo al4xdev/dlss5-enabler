@@ -4,18 +4,25 @@ import tempfile
 import zipfile
 from pathlib import Path, PureWindowsPath
 
+import py7zr
+
 from dlss5_enabler.core.archive import safe_archive_destination
 from dlss5_enabler.core.fileio import _atomic_copy_file_unlocked, atomic_write_bytes
 from dlss5_enabler.core.ini import ini_set_exact
 from dlss5_enabler.core.mutations import managed_file_lock, prepare_managed_path
-from dlss5_enabler.core.pe import DetectedApi, PeArch
-from dlss5_enabler.core.record import OptiScalerStrategyOptions
+from dlss5_enabler.core.pe import DetectedApi, PeArch, detect_optiscaler_proxy
+from dlss5_enabler.core.record import OptiScalerStrategyOptions, RegistryTouch
 from dlss5_enabler.core.util import get_cache_dir, sha256_file, unblock_file
 from dlss5_enabler.network.sources import fetch_dlssg, fetch_ngx_dlls, fetch_optiscaler
 from dlss5_enabler.operations.contexts import OptiScalerContext
 from dlss5_enabler.operations.pipeline import PipelineRunner, PipelineStep
 from dlss5_enabler.operations.steps_common import StepCleanPreviousInstall, StepSaveRecord, StepValidateTarget
-from dlss5_enabler.platform import NvidiaGpuGeneration, detect_nvidia_gpu_generation, get_platform_adapter
+from dlss5_enabler.platform import (
+    NvidiaGpuGeneration,
+    ProtonManager,
+    detect_nvidia_gpu_generation,
+    get_platform_adapter,
+)
 from dlss5_enabler.schemas.strategy import FrameGenerationMode, NrPlacement
 
 _REQUIRED_MEMBERS = frozenset({"optiscaler.dll", "optiscaler.ini", "nvngx.dll_dlssnr.dll"})
@@ -24,7 +31,7 @@ _MAX_ARCHIVE_FILES = 2048
 _MAX_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 
 
-def _archive_members(archive: zipfile.ZipFile, stage: Path) -> dict[str, zipfile.ZipInfo]:
+def _zip_members(archive: zipfile.ZipFile, stage: Path) -> dict[str, zipfile.ZipInfo]:
     selected: dict[str, zipfile.ZipInfo] = {}
     destinations: set[str] = set()
     total_size = 0
@@ -55,14 +62,52 @@ def _archive_members(archive: zipfile.ZipFile, stage: Path) -> dict[str, zipfile
 
 
 def _extract_archive(archive_path: Path, destination: Path) -> dict[str, Path]:
-    with zipfile.ZipFile(archive_path, "r") as archive:
-        selected = _archive_members(archive, destination)
-        results: dict[str, Path] = {}
-        for relative, info in selected.items():
+    if archive_path.suffix.casefold() == ".zip":
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            selected = _zip_members(archive, destination)
+            results: dict[str, Path] = {}
+            for relative, info in selected.items():
+                target = safe_archive_destination(destination, relative)
+                atomic_write_bytes(target, archive.read(info))
+                results[relative] = target
+        return results
+    if archive_path.suffix.casefold() != ".7z":
+        raise ValueError(f"Unsupported OptiScaler archive format: {archive_path.suffix}")
+    with py7zr.SevenZipFile(archive_path, "r") as archive:
+        if archive.needs_password():
+            raise ValueError("Encrypted OptiScaler archives are unsupported")
+        selected_names: list[str] = []
+        destinations: set[str] = set()
+        total_size = 0
+        for info in archive.list():
+            normalized = info.filename.replace("\\", "/")
+            if PureWindowsPath(normalized).drive or info.is_symlink:
+                raise ValueError(f"Unsafe OptiScaler archive member: {info.filename}")
+            target = safe_archive_destination(destination, normalized)
+            canonical = target.as_posix().casefold()
+            if canonical in destinations:
+                raise ValueError(f"OptiScaler archive contains a path collision: {info.filename}")
+            destinations.add(canonical)
+            if info.is_directory:
+                continue
+            total_size += info.uncompressed
+            if len(selected_names) >= _MAX_ARCHIVE_FILES or total_size > _MAX_UNCOMPRESSED_BYTES:
+                raise ValueError("OptiScaler archive exceeds safe extraction limits")
+            relative = target.relative_to(destination).as_posix()
+            if relative.casefold() not in _SKIPPED_MEMBERS:
+                selected_names.append(relative)
+        basenames = {Path(name).name.casefold() for name in selected_names}
+        missing = _REQUIRED_MEMBERS - basenames
+        if missing:
+            raise ValueError(f"OptiScaler archive is missing required members: {', '.join(sorted(missing))}")
+        archive.extract(path=destination, targets=selected_names)
+        extracted: dict[str, Path] = {}
+        for relative in selected_names:
             target = safe_archive_destination(destination, relative)
-            atomic_write_bytes(target, archive.read(info))
-            results[relative] = target
-    return results
+            if not target.is_file() or target.is_symlink():
+                raise ValueError(f"OptiScaler archive did not safely extract: {relative}")
+            extracted[relative] = target
+    return extracted
 
 
 def _find_unique(files: dict[str, Path], name: str) -> tuple[str, Path]:
@@ -99,17 +144,22 @@ class StepConfigureOptiScaler(PipelineStep[OptiScalerContext]):
         return "Validates native DLSS and selects the OptiScaler proxy"
 
     def execute(self, ctx: OptiScalerContext) -> bool:
+        if ctx.proxy_name.casefold() == "auto":
+            ctx.proxy_name = detect_optiscaler_proxy(ctx.game_exe)
         analysis = ctx.analysis
+        platform_name = get_platform_adapter().platform_name
         error = ""
         if analysis is None:
             error = "Target analysis is required before selecting OptiScaler."
-        elif get_platform_adapter().platform_name != "windows":
-            error = "OptiScaler strategy currently supports Windows only."
+        elif platform_name not in {"windows", "linux"}:
+            error = f"OptiScaler strategy does not support platform: {platform_name}."
         elif analysis.architecture is not PeArch.X64:
             error = "OptiScaler strategy currently requires an x64 game."
         elif not analysis.native_dlss:
             error = "OptiScaler strategy requires native DLSS input."
-        elif not set(analysis.apis).intersection({DetectedApi.D3D11, DetectedApi.D3D12}):
+        elif platform_name == "linux" and DetectedApi.D3D12 not in analysis.apis:
+            error = "OptiScaler on Linux/Proton currently requires a DirectX 12 game."
+        elif platform_name == "windows" and not set(analysis.apis).intersection({DetectedApi.D3D11, DetectedApi.D3D12}):
             error = "OptiScaler strategy currently supports DirectX 11 or DirectX 12 only."
         elif ctx.proxy_name.casefold() not in {"dxgi.dll", "winmm.dll", "version.dll", "winhttp.dll"}:
             error = f"Unsupported OptiScaler proxy name: {ctx.proxy_name}"
@@ -118,6 +168,13 @@ class StepConfigureOptiScaler(PipelineStep[OptiScalerContext]):
         elif not 2 <= ctx.fg_multiplier <= 6:
             error = "OptiScaler frame-generation multiplier must be between 2 and 6."
         else:
+            if platform_name == "linux":
+                ctx.proton_prefix = ProtonManager.find_prefix_for_game(ctx.game_exe)
+                if ctx.proton_prefix is None:
+                    error = (
+                        "Could not find the Wine/Proton prefix required for OptiScaler. "
+                        "Set STEAM_COMPAT_DATA_PATH or WINEPREFIX and retry."
+                    )
             ctx.frame_generation = FrameGenerationMode(ctx.frame_generation)
             ctx.nr_placement = NrPlacement(ctx.nr_placement)
             gpu = detect_nvidia_gpu_generation()
@@ -164,7 +221,7 @@ class StepFetchOptiScaler(PipelineStep[OptiScalerContext]):
             source_revision=ctx.source_revision,
         )
         ctx.ngx_bundle = fetch_ngx_dlls(lambda _message: None, force=ctx.force_download, include_sr=False)
-        if ctx.frame_generation is FrameGenerationMode.DLSSG:
+        if ctx.frame_generation is FrameGenerationMode.DLSSG and not ctx.bundle.includes_dlssg:
             ctx.dlssg_bundle = fetch_dlssg(lambda _message: None, force=ctx.force_download)
         ctx.record.binaries.update(ctx.bundle.binaries)
         ctx.record.binaries.update(ctx.ngx_bundle.binaries)
@@ -223,7 +280,7 @@ class StepPrepareOptiScaler(PipelineStep[OptiScalerContext]):
             ("NvApi", "DisableFlipMetering", "true" if ada_profile else "false"),
             ("NvApi", "DisableReflexSync", "false"),
             ("Menu", "ShortcutKey", "0x2E"),
-            ("Log", "LogToFile", "true"),
+            ("Log", "LogToFile", "false"),
             ("Log", "LogFileName", "OptiScaler.log"),
             ("Plugins", "LoadReshade", "false"),
             ("Plugins", "LoadSpecialK", "false"),
@@ -308,7 +365,7 @@ class StepInstallOptiScaler(PipelineStep[OptiScalerContext]):
         ctx.record.install_type = "OptiScaler / native DLSS"
         ctx.record.native_dlss_detected = True
         ctx.record.strategy_options = OptiScalerStrategyOptions(
-            variant="y4my4my4m-v3",
+            variant=ctx.bundle.variant,
             proxy_name=ctx.proxy_name,
             nr_passes=ctx.nr_passes,
             source_revision=ctx.bundle.source_revision,
@@ -316,6 +373,42 @@ class StepInstallOptiScaler(PipelineStep[OptiScalerContext]):
             fg_multiplier=ctx.fg_multiplier,
             nr_placement=ctx.nr_placement,
             gpu_generation=ctx.gpu_generation,
+        )
+        return True
+
+
+class StepConfigureOptiScalerWineOverrides(PipelineStep[OptiScalerContext]):
+    @property
+    def name(self) -> str:
+        return "ConfigureOptiScalerWineOverrides"
+
+    @property
+    def description(self) -> str:
+        return "Configures the selected OptiScaler proxy in the Wine/Proton prefix"
+
+    def execute(self, ctx: OptiScalerContext) -> bool:
+        if get_platform_adapter().platform_name != "linux":
+            return True
+        prefix = ctx.proton_prefix
+        if prefix is None:
+            ctx.error_message = "The Wine/Proton prefix was not resolved before installation."
+            return False
+        override_name = ctx.proxy_name.removesuffix(".dll")
+        overrides = {override_name: "native,builtin"}
+        injected, originals = ProtonManager.inject_overrides_with_originals(prefix, overrides)
+        if injected != [override_name]:
+            ctx.error_message = f"Could not persist the Wine override for {ctx.proxy_name}."
+            return False
+        existed, original = originals[override_name]
+        ctx.record.proton_prefix = prefix.prefix_path.as_posix()
+        ctx.record.registry_touched.append(
+            RegistryTouch(
+                reg_path=prefix.user_reg_path.as_posix(),
+                key=r"Software\Wine\DllOverrides",
+                value_name=override_name,
+                original_value=original,
+                original_exists=existed,
+            )
         )
         return True
 
@@ -329,6 +422,7 @@ def build_optiscaler_pipeline() -> PipelineRunner[OptiScalerContext]:
             StepPrepareOptiScaler(),
             StepCleanPreviousInstall(),
             StepInstallOptiScaler(),
+            StepConfigureOptiScalerWineOverrides(),
             StepSaveRecord(),
         ),
         name="OptiScaler Installation Pipeline",

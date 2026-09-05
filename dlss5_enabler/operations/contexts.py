@@ -14,6 +14,7 @@ from dlss5_enabler.network.sources import (
     ReshadeHeaders,
 )
 from dlss5_enabler.operations.pipeline import PipelineContext
+from dlss5_enabler.platform import SteamPrefixInfo
 from dlss5_enabler.schemas.strategy import FrameGenerationMode, GpuGeneration, NrPlacement
 
 
@@ -48,7 +49,7 @@ class OptiScalerContext(PipelineContext):
     archive_path: Path | None = None
     source_revision: str = ""
     nr_passes: int = 1
-    proxy_name: str = "dxgi.dll"
+    proxy_name: str = "auto"
     frame_generation: FrameGenerationMode = FrameGenerationMode.AUTO
     fg_multiplier: int = 2
     nr_placement: NrPlacement = NrPlacement.AFTER
@@ -58,3 +59,4 @@ class OptiScalerContext(PipelineContext):
     dlssg_bundle: DlssgBundle | None = None
     staging_directory: Path | None = None
     staged_files: dict[str, Path] = field(default_factory=dict[str, Path])
+    proton_prefix: SteamPrefixInfo | None = None

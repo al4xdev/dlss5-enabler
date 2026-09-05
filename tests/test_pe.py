@@ -14,7 +14,9 @@ from dlss5_enabler.core.pe import (
     detect_game_apis,
     detect_imported_dlls,
     detect_native_dlss,
+    detect_optiscaler_proxy,
     detect_pe_arch,
+    detect_pe_import_tables,
 )
 
 
@@ -23,6 +25,8 @@ def _create_mock_pe(
     valid_dos: bool = True,
     valid_nt: bool = True,
     imported_dlls: list[str] | None = None,
+    delay_imported_dlls: list[str] | None = None,
+    num_rva_and_sizes: int = 16,
 ) -> bytes:
     dos_header = bytearray(64)
     if valid_dos:
@@ -30,7 +34,8 @@ def _create_mock_pe(
     struct.pack_into("<I", dos_header, 0x3C, 64)
 
     nt_signature = struct.pack("<I", IMAGE_NT_SIGNATURE if valid_nt else 0x12345678)
-    num_sections = 1 if imported_dlls else 0
+    has_imports = bool(imported_dlls or delay_imported_dlls)
+    num_sections = 1 if has_imports else 0
     size_of_opt_hdr = 240
     file_header = bytearray(20)
     struct.pack_into("<H", file_header, 0, machine)
@@ -39,16 +44,26 @@ def _create_mock_pe(
 
     opt_header = bytearray(size_of_opt_hdr)
     struct.pack_into("<H", opt_header, 0, 0x20B)  # PE32+
+    struct.pack_into("<I", opt_header, 108, num_rva_and_sizes)
 
-    if not imported_dlls:
+    if not has_imports:
         return bytes(dos_header + nt_signature + file_header + opt_header)
 
     section_va = 0x1000
     section_raw_ptr = 512
-    import_rva = section_va
 
-    struct.pack_into("<I", opt_header, 120, import_rva)
-    struct.pack_into("<I", opt_header, 124, 1024)
+    std_desc_len = (len(imported_dlls) + 1) * 20 if imported_dlls else 0
+    delay_desc_len = (len(delay_imported_dlls) + 1) * 32 if delay_imported_dlls else 0
+    names_start_offset = std_desc_len + delay_desc_len
+
+    if imported_dlls:
+        struct.pack_into("<I", opt_header, 120, section_va)
+        struct.pack_into("<I", opt_header, 124, 1024)
+
+    if delay_imported_dlls:
+        delay_rva = section_va + std_desc_len
+        struct.pack_into("<I", opt_header, 216, delay_rva)
+        struct.pack_into("<I", opt_header, 220, 1024)
 
     sec_hdr = bytearray(40)
     sec_hdr[0:5] = b".rdata"
@@ -60,19 +75,29 @@ def _create_mock_pe(
     headers_blob = bytes(dos_header + nt_signature + file_header + opt_header + sec_hdr)
     padding = b"\x00" * (section_raw_ptr - len(headers_blob))
 
-    descriptors_blob = bytearray()
+    std_descriptors_blob = bytearray()
+    delay_descriptors_blob = bytearray()
     names_blob = bytearray()
 
-    name_offset_in_sec = (len(imported_dlls) + 1) * 20
-    for dll in imported_dlls:
-        desc = bytearray(20)
-        dll_name_rva = section_va + name_offset_in_sec + len(names_blob)
-        struct.pack_into("<I", desc, 12, dll_name_rva)
-        descriptors_blob.extend(desc)
-        names_blob.extend(dll.encode("ascii") + b"\x00")
+    if imported_dlls:
+        for dll in imported_dlls:
+            desc = bytearray(20)
+            dll_name_rva = section_va + names_start_offset + len(names_blob)
+            struct.pack_into("<I", desc, 12, dll_name_rva)
+            std_descriptors_blob.extend(desc)
+            names_blob.extend(dll.encode("ascii") + b"\x00")
+        std_descriptors_blob.extend(b"\x00" * 20)
 
-    descriptors_blob.extend(b"\x00" * 20)  # Null terminator descriptor
-    section_data = bytes(descriptors_blob + names_blob)
+    if delay_imported_dlls:
+        for dll in delay_imported_dlls:
+            desc = bytearray(32)
+            dll_name_rva = section_va + names_start_offset + len(names_blob)
+            struct.pack_into("<I", desc, 4, dll_name_rva)
+            delay_descriptors_blob.extend(desc)
+            names_blob.extend(dll.encode("ascii") + b"\x00")
+        delay_descriptors_blob.extend(b"\x00" * 32)
+
+    section_data = bytes(std_descriptors_blob + delay_descriptors_blob + names_blob)
     section_padding = b"\x00" * (4096 - len(section_data))
 
     return headers_blob + padding + section_data + section_padding
@@ -174,6 +199,55 @@ def test_detect_imported_dlls_missing_file(tmp_path: Path) -> None:
     assert detect_imported_dlls(tmp_path / "missing.exe") == []
 
 
+def test_detect_delay_imported_dlls_and_apis(tmp_path: Path) -> None:
+    target = tmp_path / "delay_dx12_game.exe"
+    target.write_bytes(_create_mock_pe(delay_imported_dlls=["d3d12.dll", "dxgi.dll"]))
+
+    dlls = detect_imported_dlls(target)
+    assert "d3d12.dll" in dlls
+    assert "dxgi.dll" in dlls
+
+    apis = detect_game_apis(target)
+    assert DetectedApi.D3D12 in apis
+    assert DetectedApi.D3D11 in apis
+
+
+def test_detect_both_standard_and_delay_imported_dlls(tmp_path: Path) -> None:
+    target = tmp_path / "mixed_game.exe"
+    target.write_bytes(
+        _create_mock_pe(
+            imported_dlls=["dxgi.dll", "kernel32.dll"],
+            delay_imported_dlls=["d3d12.dll", "dxgi.dll"],
+        )
+    )
+
+    dlls = detect_imported_dlls(target)
+    assert "dxgi.dll" in dlls
+    assert "d3d12.dll" in dlls
+    assert "kernel32.dll" in dlls
+    assert dlls.count("dxgi.dll") == 1
+
+    apis = detect_game_apis(target)
+    assert DetectedApi.D3D12 in apis
+    assert DetectedApi.D3D11 in apis
+
+
+def test_detect_delay_imported_dlls_insufficient_rva_sizes(tmp_path: Path) -> None:
+    target = tmp_path / "small_rva_sizes.exe"
+    target.write_bytes(_create_mock_pe(delay_imported_dlls=["d3d12.dll"], num_rva_and_sizes=2))
+
+    dlls = detect_imported_dlls(target)
+    assert "d3d12.dll" not in dlls
+    assert detect_game_apis(target) == []
+
+
+def test_detect_native_dlss_from_delay_import(tmp_path: Path) -> None:
+    target = tmp_path / "native_dlss_delay.exe"
+    target.write_bytes(_create_mock_pe(delay_imported_dlls=["nvngx_dlss.dll"]))
+
+    assert detect_native_dlss(target)
+
+
 def test_detect_native_dlss_from_import(tmp_path: Path) -> None:
     target = tmp_path / "native_dlss.exe"
     target.write_bytes(_create_mock_pe(imported_dlls=["nvngx_dlss.dll"]))
@@ -234,3 +308,58 @@ def test_check_api_mismatches_warnings(tmp_path: Path) -> None:
     w4 = check_api_mismatches(gl_target, d3d9=False, opengl=False, vulkan_layer=False)
     assert len(w4) == 1
     assert "Consider passing --opengl" in w4[0]
+
+
+def test_detect_pe_import_tables_separates_static_and_delay(tmp_path: Path) -> None:
+    target = tmp_path / "split_imports.exe"
+    target.write_bytes(
+        _create_mock_pe(
+            imported_dlls=["kernel32.dll", "dxgi.dll"],
+            delay_imported_dlls=["d3d12.dll"],
+        )
+    )
+
+    static_dlls, delay_dlls = detect_pe_import_tables(target)
+    assert "dxgi.dll" in static_dlls
+    assert "kernel32.dll" in static_dlls
+    assert "d3d12.dll" not in static_dlls
+    assert delay_dlls == ["d3d12.dll"]
+
+
+def test_detect_optiscaler_proxy_empty_or_non_pe(tmp_path: Path) -> None:
+    non_pe = tmp_path / "dummy.exe"
+    non_pe.write_bytes(b"not-pe")
+    assert detect_optiscaler_proxy(non_pe) == "dxgi.dll"
+    assert detect_optiscaler_proxy(tmp_path / "nonexistent.exe") == "dxgi.dll"
+
+    empty_pe = tmp_path / "empty.exe"
+    empty_pe.write_bytes(_create_mock_pe())
+    assert detect_optiscaler_proxy(empty_pe) == "dxgi.dll"
+
+
+def test_detect_optiscaler_proxy_static_dxgi(tmp_path: Path) -> None:
+    dxgi_target = tmp_path / "game.exe"
+    dxgi_target.write_bytes(_create_mock_pe(imported_dlls=["dxgi.dll", "d3d12.dll"]))
+    assert detect_optiscaler_proxy(dxgi_target) == "dxgi.dll"
+
+
+def test_detect_optiscaler_proxy_static_winmm(tmp_path: Path) -> None:
+    winmm_target = tmp_path / "game.exe"
+    winmm_target.write_bytes(_create_mock_pe(imported_dlls=["winmm.dll", "d3d12.dll"]))
+    assert detect_optiscaler_proxy(winmm_target) == "winmm.dll"
+
+
+def test_detect_optiscaler_proxy_via_companion_dll(tmp_path: Path) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(_create_mock_pe(delay_imported_dlls=["dxgi.dll", "d3d12.dll"]))
+
+    companion = tmp_path / "bink2w64.dll"
+    companion.write_bytes(_create_mock_pe(imported_dlls=["kernel32.dll", "winmm.dll"]))
+
+    assert detect_optiscaler_proxy(game_exe) == "winmm.dll"
+
+
+def test_detect_optiscaler_proxy_decima_name(tmp_path: Path) -> None:
+    ds_exe = tmp_path / "DeathStranding.exe"
+    ds_exe.write_bytes(_create_mock_pe(delay_imported_dlls=["dxgi.dll"]))
+    assert detect_optiscaler_proxy(ds_exe) == "winmm.dll"

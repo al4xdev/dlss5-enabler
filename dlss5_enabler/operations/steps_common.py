@@ -74,9 +74,19 @@ class StepValidateTarget(PipelineStep[PipelineContext]):
             ctx.error_message = access_error
             return False
         managed_sr = (
-            [item for item in previous.files if Path(item.path).name.lower() == "nvngx_dlss.dll"] if previous else []
+            [
+                item
+                for item in previous.files
+                if Path(item.path).resolve() == (ctx.game_dir / "nvngx_dlss.dll").resolve()
+            ]
+            if previous
+            else []
         )
-        native_dlss = any(item.backup for item in managed_sr) or (not managed_sr and detect_native_dlss(ctx.game_exe))
+        native_dlss = (
+            previous.native_dlss_detected
+            if previous and previous.native_dlss_detected
+            else (any(item.backup for item in managed_sr) or (not managed_sr and detect_native_dlss(ctx.game_exe)))
+        )
         apis = tuple(detect_game_apis(ctx.game_exe))
         if not apis:
             apis = analyze_capabilities(ctx.game_exe, previous).apis

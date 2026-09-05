@@ -21,6 +21,7 @@ EXPECTED_COMPONENTS = frozenset(
         "lumenite",
         "dgvoodoo2",
         "reshade_addon",
+        "optiscaler",
     }
 )
 
@@ -33,6 +34,7 @@ class ArtifactKind(str, Enum):
     FILE = "file"
     JSON = "json"
     ZIP = "zip"
+    SEVEN_Z = "7z"
 
 
 class DiscoveryKind(str, Enum):
@@ -149,13 +151,13 @@ class ComponentPolicy(ManifestModel):
         versions = tuple(item.version for item in self.formats)
         if len(versions) != len(set(versions)):
             raise ValueError("archive format versions must be unique")
-        if self.artifact_kind is ArtifactKind.ZIP:
+        if self.artifact_kind in {ArtifactKind.ZIP, ArtifactKind.SEVEN_Z}:
             if not versions:
-                raise ValueError("zip components require at least one archive format")
+                raise ValueError("archive components require at least one archive format")
             if min(versions) < self.min_supported_format or max(versions) > self.max_supported_format:
                 raise ValueError("archive format version is outside the supported range")
         elif self.formats:
-            raise ValueError("only zip components can define archive formats")
+            raise ValueError("only archive components can define archive formats")
         if self.discovery.kind is DiscoveryKind.REPOSITORY_ARCHIVE and any(
             re.fullmatch(r"[0-9a-f]{40}", artifact.revision) is None for artifact in self.stable_artifacts
         ):

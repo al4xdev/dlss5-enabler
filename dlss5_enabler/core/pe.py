@@ -124,19 +124,17 @@ def _rva_to_offset(rva: int, sections: list[tuple[int, int, int, int]]) -> int |
     return None
 
 
-def detect_imported_dlls(exe_path: Path | str) -> list[str]:
-    path = Path(exe_path)
-    if not path.is_file():
-        return []
-
-    dlls: list[str] = []
+def detect_pe_import_tables(exe_path: Path | str) -> tuple[list[str], list[str]]:
+    static_dlls: list[str] = []
+    delay_dlls: list[str] = []
     try:
-        with path.open("rb") as f:
+        with Path(exe_path).open("rb") as f:
             dos_header = f.read(64)
-            if len(dos_header) >= 64 and struct.unpack_from("<H", dos_header, 0)[0] == IMAGE_DOS_SIGNATURE:
-                e_lfanew: int = struct.unpack_from("<I", dos_header, 0x3C)[0]
-                f.seek(e_lfanew)
-                if f.read(4) == b"PE\x00\x00":
+            if len(dos_header) >= 64 and dos_header[:2] == b"MZ":
+                nt_offset = struct.unpack_from("<I", dos_header, 0x3C)[0]
+                f.seek(nt_offset)
+                nt_signature = f.read(4)
+                if nt_signature == b"PE\x00\x00":
                     file_header = f.read(20)
                     if len(file_header) >= 20:
                         num_sections: int = struct.unpack_from("<H", file_header, 2)[0]
@@ -146,11 +144,29 @@ def detect_imported_dlls(exe_path: Path | str) -> list[str]:
                         opt_hdr_magic = struct.unpack("<H", f.read(2))[0]
                         is_64bit = opt_hdr_magic == OPTIONAL_HEADER_MAGIC_PE32_PLUS
 
-                        import_dir_offset_in_opt = 120 if is_64bit else 104
-                        f.seek(opt_hdr_pos + import_dir_offset_in_opt)
-                        import_rva, _ = struct.unpack("<II", f.read(8))
+                        rva_sizes_offset = 108 if is_64bit else 92
+                        num_rva_and_sizes = 0
+                        if size_of_opt_hdr >= rva_sizes_offset + 4:
+                            f.seek(opt_hdr_pos + rva_sizes_offset)
+                            num_rva_and_sizes = struct.unpack("<I", f.read(4))[0]
 
-                        if import_rva != 0:
+                        import_rva = 0
+                        import_dir_offset = 120 if is_64bit else 104
+                        if size_of_opt_hdr >= import_dir_offset + 8 and (
+                            num_rva_and_sizes == 0 or num_rva_and_sizes >= 2
+                        ):
+                            f.seek(opt_hdr_pos + import_dir_offset)
+                            import_rva = struct.unpack("<II", f.read(8))[0]
+
+                        delay_import_rva = 0
+                        delay_dir_offset = 216 if is_64bit else 200
+                        if size_of_opt_hdr >= delay_dir_offset + 8 and (
+                            num_rva_and_sizes == 0 or num_rva_and_sizes >= 14
+                        ):
+                            f.seek(opt_hdr_pos + delay_dir_offset)
+                            delay_import_rva = struct.unpack("<II", f.read(8))[0]
+
+                        if import_rva != 0 or delay_import_rva != 0:
                             f.seek(opt_hdr_pos + size_of_opt_hdr)
                             sections: list[tuple[int, int, int, int]] = []
                             for _ in range(num_sections):
@@ -163,33 +179,90 @@ def detect_imported_dlls(exe_path: Path | str) -> list[str]:
                                 raw_ptr = struct.unpack_from("<I", sec_bytes, 20)[0]
                                 sections.append((va, vs, raw_ptr, raw_size))
 
-                            import_offset = _rva_to_offset(import_rva, sections)
-                            if import_offset is not None:
-                                f.seek(import_offset)
-                                while True:
-                                    desc_bytes = f.read(20)
-                                    if len(desc_bytes) < 20 or desc_bytes == b"\x00" * 20:
-                                        break
-                                    name_rva = struct.unpack_from("<I", desc_bytes, 12)[0]
-                                    if name_rva == 0:
-                                        continue
+                            if import_rva != 0:
+                                import_offset = _rva_to_offset(import_rva, sections)
+                                if import_offset is not None:
+                                    f.seek(import_offset)
+                                    while True:
+                                        desc_bytes = f.read(20)
+                                        if len(desc_bytes) < 20 or desc_bytes == b"\x00" * 20:
+                                            break
+                                        name_rva = struct.unpack_from("<I", desc_bytes, 12)[0]
+                                        if name_rva == 0:
+                                            continue
 
-                                    name_offset = _rva_to_offset(name_rva, sections)
-                                    if name_offset is not None:
-                                        curr_pos = f.tell()
-                                        f.seek(name_offset)
-                                        raw_name = b""
-                                        while char := f.read(1):
-                                            if char == b"\x00":
-                                                break
-                                            raw_name += char
-                                        dll_name = raw_name.decode("utf-8", errors="ignore").lower()
-                                        if dll_name and dll_name not in dlls:
-                                            dlls.append(dll_name)
-                                        f.seek(curr_pos)
+                                        name_offset = _rva_to_offset(name_rva, sections)
+                                        if name_offset is not None:
+                                            curr_pos = f.tell()
+                                            f.seek(name_offset)
+                                            raw_name = b""
+                                            while char := f.read(1):
+                                                if char == b"\x00":
+                                                    break
+                                                raw_name += char
+                                            dll_name = raw_name.decode("utf-8", errors="ignore").lower()
+                                            if dll_name and dll_name not in static_dlls:
+                                                static_dlls.append(dll_name)
+                                            f.seek(curr_pos)
+
+                            if delay_import_rva != 0:
+                                delay_offset = _rva_to_offset(delay_import_rva, sections)
+                                if delay_offset is not None:
+                                    f.seek(delay_offset)
+                                    while True:
+                                        desc_bytes = f.read(32)
+                                        if len(desc_bytes) < 32 or desc_bytes == b"\x00" * 32:
+                                            break
+                                        name_rva = struct.unpack_from("<I", desc_bytes, 4)[0]
+                                        if name_rva == 0:
+                                            continue
+
+                                        name_offset = _rva_to_offset(name_rva, sections)
+                                        if name_offset is not None:
+                                            curr_pos = f.tell()
+                                            f.seek(name_offset)
+                                            raw_name = b""
+                                            while char := f.read(1):
+                                                if char == b"\x00":
+                                                    break
+                                                raw_name += char
+                                            dll_name = raw_name.decode("utf-8", errors="ignore").lower()
+                                            if dll_name and dll_name not in delay_dlls:
+                                                delay_dlls.append(dll_name)
+                                            f.seek(curr_pos)
     except Exception:
         pass
-    return dlls
+    return static_dlls, delay_dlls
+
+
+def detect_imported_dlls(exe_path: Path | str) -> list[str]:
+    static_dlls, delay_dlls = detect_pe_import_tables(exe_path)
+    combined: list[str] = []
+    for dll in (*static_dlls, *delay_dlls):
+        if dll not in combined:
+            combined.append(dll)
+    return combined
+
+
+def detect_optiscaler_proxy(game_exe: Path | str) -> str:
+    path = Path(game_exe)
+    if not path.is_file():
+        return "dxgi.dll"
+    static_dlls, delay_dlls = detect_pe_import_tables(path)
+    if (not static_dlls and not delay_dlls) or "dxgi.dll" in static_dlls:
+        return "dxgi.dll"
+    if "winmm.dll" in static_dlls:
+        return "winmm.dll"
+
+    game_dir = path.parent
+    for candidate_name in ("bink2w64.dll", "binkw64.dll", "eossdk-win64-shipping.dll"):
+        candidate_path = game_dir / candidate_name
+        if candidate_path.is_file():
+            comp_static, _ = detect_pe_import_tables(candidate_path)
+            if "winmm.dll" in comp_static:
+                return "winmm.dll"
+
+    return "winmm.dll" if path.name.lower() in {"deathstranding.exe", "ds.exe"} else "dxgi.dll"
 
 
 def detect_game_apis(exe_path: Path | str) -> list[DetectedApi]:
