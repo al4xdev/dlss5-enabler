@@ -219,13 +219,13 @@ def install_cmd(
         ),
     ] = True,
     d3d9: Annotated[
-        bool,
+        bool | None,
         typer.Option(
-            "--d3d9",
-            help="RenoDX only: translate a DirectX 9 game through dgVoodoo2",
+            "--d3d9/--no-d3d9",
+            help="RenoDX only: auto-detect DirectX 9, or explicitly enable/disable dgVoodoo2 translation",
             rich_help_panel="RenoDX / ReShade options",
         ),
-    ] = False,
+    ] = None,
     opengl: Annotated[
         bool,
         typer.Option(
@@ -361,6 +361,7 @@ def install_cmd(
         console.print("[bold red]--fg-multiplier above 2 requires --frame-generation dlssg.[/bold red]")
         raise typer.Exit(code=2)
     adapter = get_platform_adapter()
+    d3d9_summary = "auto" if d3d9 is None else ("enabled" if d3d9 else "disabled")
     plan = [
         "[bold cyan]Installing game setup[/bold cyan]",
         f"Game: [yellow]{exe}[/yellow]",
@@ -383,7 +384,7 @@ def install_cmd(
         plan.extend(
             (
                 f"LumeniteFX: [{'green' if lumenite else 'dim'}]{'enabled' if lumenite else 'disabled'}[/]",
-                f"DirectX 9 translation: [{'green' if d3d9 else 'dim'}]{'enabled' if d3d9 else 'disabled'}[/]",
+                f"DirectX 9 translation: [cyan]{d3d9_summary}[/cyan]",
                 f"OpenGL mode: [{'green' if opengl else 'dim'}]{'enabled' if opengl else 'disabled'}[/]",
                 f"Vulkan layer: [{'green' if vulkan_layer else 'dim'}]{'enabled' if vulkan_layer else 'disabled'}[/]",
             )
@@ -414,9 +415,12 @@ def install_cmd(
         raise typer.Exit(code=1)
 
     rec = record_load(exe.parent)
+    effective_d3d9 = rec.install_options.d3d9 if rec is not None else d3d9 is True
     if rec and rec.proton_prefix:
         pfx_info = rec.proton_prefix
-        launch_opts = ProtonManager.get_launch_options(["d3d9" if d3d9 else ("opengl32" if opengl else "dxgi")])
+        launch_opts = ProtonManager.get_launch_options(
+            ["d3d9" if effective_d3d9 else ("opengl32" if opengl else "dxgi")]
+        )
         console.print(
             Panel.fit(
                 f"[bold green]Steam / Proton Integration Active[/bold green]\n"

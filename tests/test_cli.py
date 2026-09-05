@@ -129,6 +129,31 @@ def test_cli_install_command_success(tmp_path: Path, mocker: MockerFixture) -> N
     assert "DLSS 5 Feed" in res.stdout
 
 
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [([], None), (["--d3d9"], True), (["--no-d3d9"], False)],
+)
+def test_cli_directx9_mode_defaults_to_auto_and_supports_overrides(
+    tmp_path: Path,
+    mocker: MockerFixture,
+    arguments: list[str],
+    expected: bool | None,
+) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    install = mocker.patch("dlss5_enabler.cli.run_install", return_value=True)
+    mocker.patch("dlss5_enabler.cli.record_load", return_value=None)
+
+    result = runner.invoke(app, ["install", str(game_exe), *arguments])
+
+    assert result.exit_code == 0
+    assert install.call_args.kwargs["d3d9_translate"] is expected
+    assert (
+        f"DirectX 9 translation: {'auto' if expected is None else ('enabled' if expected else 'disabled')}"
+        in result.stdout
+    )
+
+
 def test_cli_install_summary_only_shows_selected_engine_options(tmp_path: Path, mocker: MockerFixture) -> None:
     game_exe = tmp_path / "game.exe"
     archive = tmp_path / "optiscaler.zip"

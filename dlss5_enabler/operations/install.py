@@ -27,7 +27,7 @@ def build_install_pipeline(strategy: InstallStrategy = InstallStrategy.RENODX) -
 def run_install(
     game_exe_path: Path | str,
     install_lumenite: bool = True,
-    d3d9_translate: bool = False,
+    d3d9_translate: bool | None = None,
     opengl: bool = False,
     install_vulkan_layer: bool = False,
     force_download: bool = False,
@@ -63,7 +63,7 @@ def run_install(
 def _run_install_unlocked(
     game_exe_path: Path | str,
     install_lumenite: bool = True,
-    d3d9_translate: bool = False,
+    d3d9_translate: bool | None = None,
     opengl: bool = False,
     install_vulkan_layer: bool = False,
     force_download: bool = False,
@@ -97,7 +97,8 @@ def _run_install_unlocked(
     ctx = RenoDxContext(
         game_exe=game_exe,
         install_lumenite=install_lumenite,
-        d3d9_translate=d3d9_translate,
+        d3d9_translate=d3d9_translate is True,
+        d3d9_auto=d3d9_translate is None,
         opengl=opengl,
         install_vulkan_layer=install_vulkan_layer,
         force_download=force_download,

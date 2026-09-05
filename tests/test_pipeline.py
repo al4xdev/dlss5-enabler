@@ -8,7 +8,13 @@ import pytest
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
 
-from dlss5_enabler.core.pe import IMAGE_DOS_SIGNATURE, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386, PeArch
+from dlss5_enabler.core.pe import (
+    IMAGE_DOS_SIGNATURE,
+    IMAGE_FILE_MACHINE_AMD64,
+    IMAGE_FILE_MACHINE_I386,
+    DetectedApi,
+    PeArch,
+)
 from dlss5_enabler.core.record import (
     CURRENT_RECORD_SCHEMA_VERSION,
     IniTouch,
@@ -548,6 +554,38 @@ def test_step_validate_target_success_x64(tmp_path: Path, mocker: MockerFixture)
     assert not ctx.is_32bit
     assert ctx.reshade_api == "dxgi"
     assert ctx.record.architecture == "x64"
+
+
+@pytest.mark.parametrize(
+    ("apis", "explicit", "expected"),
+    [
+        ((DetectedApi.D3D9,), None, True),
+        ((DetectedApi.D3D11,), None, False),
+        ((DetectedApi.D3D9,), False, False),
+    ],
+)
+def test_renodx_resolves_directx9_translation_automatically_and_honors_override(
+    tmp_path: Path,
+    mocker: MockerFixture,
+    apis: tuple[DetectedApi, ...],
+    explicit: bool | None,
+    expected: bool,
+) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ_DUMMY")
+    mocker.patch("dlss5_enabler.operations.steps_common.detect_pe_arch", return_value=PeArch.X64)
+    mocker.patch("dlss5_enabler.operations.steps_common.detect_game_apis", return_value=list(apis))
+    mocker.patch("dlss5_enabler.operations.steps_common.file_is_writable", return_value=True)
+    ctx = RenoDxContext(
+        game_exe=game_exe,
+        d3d9_translate=explicit is True,
+        d3d9_auto=explicit is None,
+    )
+
+    assert StepValidateTarget().execute(ctx)
+    assert StepConfigureRenoDx().execute(ctx)
+    assert ctx.d3d9_translate is expected
+    assert ctx.record.install_options.d3d9 is expected
 
 
 def test_renodx_configuration_selects_direct_path_after_native_dlss_analysis(

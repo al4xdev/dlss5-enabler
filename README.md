@@ -81,7 +81,7 @@ Choosing OptiScaler does not make a non-DLSS game compatible. Native DLSS is the
 | --- | --- | --- |
 | DirectX 11 / 12 | Default | ReShade `dxgi.dll` |
 | Native DLSS on Windows x64 DirectX 11 / 12 | `--engine optiscaler` | Validated OptiScaler proxy, default `dxgi.dll` |
-| DirectX 9 | `--d3d9` | dgVoodoo2 translation plus the 64-bit feeder host when required |
+| DirectX 9 | automatic, or `--d3d9` | dgVoodoo2 translation plus the 64-bit feeder host when required |
 | OpenGL | `--opengl` | ReShade `opengl32.dll` |
 | Vulkan | `--vulkan-layer` | Feeder Vulkan-layer fallback when available upstream |
 | 32-bit games | Automatic detection | 32-bit feeder addon with a 64-bit host bridge |
@@ -210,7 +210,7 @@ Options:
 | Option | Purpose |
 | --- | --- |
 | `--lumenite` / `--no-lumenite` | Enable or disable LumeniteFX; enabled by default |
-| `--d3d9` | Install the dgVoodoo2 DirectX 9 translation path |
+| `--d3d9`, `--no-d3d9` | Override automatic DirectX 9 detection; dgVoodoo2 is enabled automatically only for detected D3D9 games |
 | `--opengl` | Use the OpenGL ReShade hook |
 | `--vulkan-layer` | Request the Vulkan-layer fallback |
 | `--engine renodx` | Use the RenoDX/ReShade strategy; this is the default |
@@ -224,7 +224,7 @@ Options:
 | `-f`, `--force-download` | Ignore cached assets and fetch them again |
 | `-v`, `--verbose` | Enable detailed console and file logging |
 
-`--d3d9` and `--opengl` cannot be combined.
+DirectX 9 translation is automatic when neither override is passed. `--d3d9` forces it, while `--no-d3d9` keeps the direct hook even when D3D9 is detected. `--d3d9` and `--opengl` cannot be combined.
 
 The supported OptiScaler archive is `OptiScaler_DLSSNR_MultiPass_MFG6X_fix_v3_by_y4my4my4m.zip` with SHA-256 `f927b5aed15d09b23f559433d6740834f550d79bb2b75c7315602319819a3096`. The author currently publishes this build outside GitHub releases; the CLI does not invent a download URL or silently replace it with another fork.
 

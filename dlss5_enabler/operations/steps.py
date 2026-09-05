@@ -13,7 +13,7 @@ from dlss5_enabler.core.mutations import (
     prepare_runtime_artifacts,
     track_created_directories,
 )
-from dlss5_enabler.core.pe import PeArch, check_api_mismatches
+from dlss5_enabler.core.pe import DetectedApi, PeArch, check_api_mismatches
 from dlss5_enabler.core.record import (
     IniTouch,
     InstallOptions,
@@ -122,6 +122,11 @@ class StepConfigureRenoDx(PipelineStep[RenoDxContext]):
         if analysis is None:
             ctx.error_message = "Target analysis is required before selecting the RenoDX installation."
             return False
+        if ctx.d3d9_auto:
+            ctx.d3d9_translate = DetectedApi.D3D9 in analysis.apis and not ctx.opengl
+            logger.info(
+                "DirectX 9 translation auto-detection: " + ("enabled" if ctx.d3d9_translate else "not required")
+            )
         if ctx.d3d9_translate and ctx.opengl:
             ctx.error_message = "D3D9 translation and OpenGL mode cannot be enabled together."
             return False

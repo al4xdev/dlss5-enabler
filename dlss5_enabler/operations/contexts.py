@@ -21,6 +21,7 @@ from dlss5_enabler.schemas.strategy import FrameGenerationMode, GpuGeneration, N
 class RenoDxContext(PipelineContext):
     install_lumenite: bool = True
     d3d9_translate: bool = False
+    d3d9_auto: bool = True
     opengl: bool = False
     install_vulkan_layer: bool = False
     reshade_dir: Path = field(default_factory=Path)
