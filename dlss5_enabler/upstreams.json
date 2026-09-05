@@ -135,6 +135,31 @@
         }
       ]
     },
+    "ngx_fg": {
+      "provider": "github",
+      "repository": "RankFTW/rhi-repo",
+      "artifact_kind": "zip",
+      "discovery": {
+        "kind": "release_list",
+        "asset_patterns": ["nvngx_dlssg_*.zip"],
+        "release_tag_prefix": "dlssg-"
+      },
+      "stable_artifacts": [
+        {
+          "revision": "dlssg-310.9.0",
+          "name": "nvngx_dlssg_310.9.0.zip",
+          "url": "https://github.com/RankFTW/rhi-repo/releases/download/dlssg-310.9.0/nvngx_dlssg_310.9.0.zip",
+          "sha256": "546a107a92352fa0955eb0d57a51e7b8eeaa79c8f094836949c395b9d14f8b53",
+          "size_bytes": 3669272
+        }
+      ],
+      "formats": [
+        {
+          "version": 1,
+          "required_members": ["*nvngx_dlssg.dll"]
+        }
+      ]
+    },
     "reshade_headers": {
       "provider": "github",
       "repository": "crosire/reshade-shaders",

@@ -13,7 +13,7 @@ from dlss5_enabler.core.record import (
 )
 from dlss5_enabler.operations.pipeline import PipelineResult, PipelineStatus
 from dlss5_enabler.operations.update import GameUpdateStatus, run_update
-from dlss5_enabler.schemas.strategy import InstallStrategy
+from dlss5_enabler.schemas.strategy import FrameGenerationMode, InstallStrategy, NrPlacement
 
 
 def _write_record(
@@ -134,6 +134,9 @@ def test_update_preserves_saved_optiscaler_source_and_options(tmp_path: Path, mo
         optiscaler_source_revision="f" * 64,
         optiscaler_nr_passes=4,
         optiscaler_proxy="winmm.dll",
+        optiscaler_frame_generation=FrameGenerationMode.OFF,
+        optiscaler_fg_multiplier=2,
+        optiscaler_nr_placement=NrPlacement.AFTER,
     )
 
 

@@ -1,7 +1,7 @@
 [project]
 name = "dlss5-enabler"
-version = "1.1.4"
-description = "Transactional cross-platform installer for the DLSS5-Feeder, RenoDX, ReShade, and LumeniteFX stack"
+version = "1.2.0"
+description = "Transactional installer for RenoDX, DLSS5-Feeder, and OptiScaler game rendering upgrades"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

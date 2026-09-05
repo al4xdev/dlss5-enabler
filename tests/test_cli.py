@@ -24,9 +24,21 @@ def disable_update_checks(mocker: MockerFixture) -> MagicMock:
 
 
 def test_cli_help() -> None:
-    res = runner.invoke(app, ["--help"])
+    res = runner.invoke(app, ["--help"], terminal_width=200)
     assert res.exit_code == 0
     assert "DLSS5 Enabler" in res.stdout
+    assert "switch" in res.stdout
+    assert "preserving its saved engine" in res.stdout
+    assert "options" in res.stdout
+
+
+def test_cli_install_help_separates_engine_options() -> None:
+    result = runner.invoke(app, ["install", "--help"], terminal_width=200)
+
+    assert result.exit_code == 0
+    assert "RenoDX / ReShade options" in result.stdout
+    assert "OptiScaler options" in result.stdout
+    assert "native-DLSS Windows x64" in result.stdout
 
 
 def test_cli_list_empty(mocker: MockerFixture) -> None:
@@ -115,6 +127,61 @@ def test_cli_install_command_success(tmp_path: Path, mocker: MockerFixture) -> N
     assert "Activate ReShade effects" in res.stdout
     assert "LUMENITE: Kernel 2.0" in res.stdout
     assert "DLSS 5 Feed" in res.stdout
+
+
+def test_cli_install_summary_only_shows_selected_engine_options(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    archive = tmp_path / "optiscaler.zip"
+    game_exe.write_bytes(b"MZ")
+    archive.write_bytes(b"ZIP")
+    install = mocker.patch("dlss5_enabler.cli.run_install", return_value=True)
+    mocker.patch("dlss5_enabler.cli.record_load", return_value=None)
+    mocker.patch("dlss5_enabler.cli._show_activation_guide")
+
+    result = runner.invoke(
+        app,
+        [
+            "install",
+            str(game_exe),
+            "--engine",
+            "optiscaler",
+            "--optiscaler-archive",
+            str(archive),
+            "--frame-generation",
+            "dlssg",
+            "--fg-multiplier",
+            "4",
+            "--nr-placement",
+            "before",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "OptiScaler package" in result.stdout
+    assert "Neural Rendering passes" in result.stdout
+    assert "Frame generation: dlssg" in result.stdout
+    assert "Frame multiplier: 4x" in result.stdout
+    assert "NR placement: before" in result.stdout
+    assert "LumeniteFX:" not in result.stdout
+    assert "DirectX 9 translation" not in result.stdout
+    assert install.call_args.kwargs["optiscaler_frame_generation"].value == "dlssg"
+    assert install.call_args.kwargs["optiscaler_fg_multiplier"] == 4
+    assert install.call_args.kwargs["optiscaler_nr_placement"].value == "before"
+
+
+def test_cli_install_rejects_multiplier_without_dlssg(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    install = mocker.patch("dlss5_enabler.cli.run_install")
+
+    result = runner.invoke(
+        app,
+        ["install", str(game_exe), "--engine", "optiscaler", "--fg-multiplier", "4"],
+    )
+
+    assert result.exit_code == 2
+    assert "requires --frame-generation dlssg" in result.stdout
+    install.assert_not_called()
 
 
 def test_cli_install_resolves_unique_managed_executable_name(tmp_path: Path, mocker: MockerFixture) -> None:
@@ -448,3 +515,55 @@ def test_cli_update_failure_has_nonzero_exit(tmp_path: Path, mocker: MockerFixtu
     assert result.exit_code == 1
     assert "Record invalid" in result.stdout
     assert "Activate ReShade effects" not in result.stdout
+
+
+def test_cli_switch_delegates_to_transactional_update(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    archive = tmp_path / "optiscaler.zip"
+    game_exe.write_bytes(b"MZ")
+    archive.write_bytes(b"ZIP")
+    update = mocker.patch(
+        "dlss5_enabler.cli.run_update",
+        return_value=GameUpdateResult(GameUpdateStatus.REINSTALLED, "Switched successfully."),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "switch",
+            str(game_exe),
+            "optiscaler",
+            "--optiscaler-archive",
+            str(archive),
+            "--nr-passes",
+            "2",
+            "--frame-generation",
+            "dlssg",
+            "--fg-multiplier",
+            "4",
+            "--nr-placement",
+            "before",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Switching or reapplying game setup" in result.stdout
+    assert "Switched successfully" in result.stdout
+    assert update.call_args.kwargs["strategy"].value == "optiscaler"
+    assert update.call_args.kwargs["optiscaler_archive"] == archive
+    assert update.call_args.kwargs["optiscaler_nr_passes"] == 2
+    assert update.call_args.kwargs["optiscaler_frame_generation"].value == "dlssg"
+    assert update.call_args.kwargs["optiscaler_fg_multiplier"] == 4
+    assert update.call_args.kwargs["optiscaler_nr_placement"].value == "before"
+
+
+def test_cli_switch_rejects_optiscaler_options_for_renodx(tmp_path: Path, mocker: MockerFixture) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(b"MZ")
+    update = mocker.patch("dlss5_enabler.cli.run_update")
+
+    result = runner.invoke(app, ["switch", str(game_exe), "renodx", "--nr-passes", "2"])
+
+    assert result.exit_code == 2
+    assert "cannot be used with RenoDX" in result.stdout
+    update.assert_not_called()

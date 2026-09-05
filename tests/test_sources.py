@@ -12,6 +12,7 @@ from dlss5_enabler.network.manifest import load_upstream_manifest
 from dlss5_enabler.network.resolver import ArtifactResolutionError, ResolutionWarningCode, UpstreamResolutionError
 from dlss5_enabler.network.sources import (
     fetch_dgvoodoo,
+    fetch_dlssg,
     fetch_feeder,
     fetch_lumenite,
     fetch_ngx_dlls,
@@ -333,6 +334,39 @@ def test_fetch_ngx_requires_canonical_dll_names(tmp_path: Path, mocker: MockerFi
         fetch_ngx_dlls(log=lambda _message: None, force=True)
     assert isinstance(captured.value.latest, ArtifactResolutionError)
     assert captured.value.latest.code is ResolutionWarningCode.CONTENT_MISSING
+
+
+def test_fetch_dlssg_uses_manifest_url_and_canonical_runtime(tmp_path: Path, mocker: MockerFixture) -> None:
+    mocker.patch("dlss5_enabler.network.sources.get_cache_dir", return_value=tmp_path)
+    manifest: dict[str, Any] = {
+        "dlssnr": [{"version": "310.8.SF-v2", "url": "https://example.com/nr.zip"}],
+        "dlss": [{"version": "310.8.0", "url": "https://example.com/sr.zip"}],
+        "dlssg": [{"version": "310.9.0", "url": "https://example.com/fg.zip"}],
+    }
+    mocker.patch(
+        "dlss5_enabler.network.sources.http_get_json",
+        return_value={"sha": MANIFEST_REVISION},
+    )
+
+    def mock_download(url: str, dest: Path | str, progress_fn: Any = None) -> Path:
+        path = Path(dest)
+        if url.endswith("dlss_manifest.json"):
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+        else:
+            path.write_bytes(_create_mock_zip({"nested/nvngx_dlssg.dll": b"DLSSG"}))
+        return path
+
+    download = mocker.patch("dlss5_enabler.network.sources.http_download_file", side_effect=mock_download)
+
+    bundle = fetch_dlssg(log=lambda _message: None, force=True)
+
+    assert bundle.version == "310.9.0"
+    assert bundle.dll_path is not None
+    assert bundle.dll_path.read_bytes() == b"DLSSG"
+    assert [item.args[0] for item in download.call_args_list] == [
+        f"https://raw.githubusercontent.com/RankFTW/RHI/{MANIFEST_REVISION}/dlss_manifest.json",
+        "https://example.com/fg.zip",
+    ]
 
 
 def test_fetch_reshade(tmp_path: Path, mocker: MockerFixture) -> None:

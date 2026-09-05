@@ -11,7 +11,7 @@ from dlss5_enabler.core.fileio import atomic_write_bytes, atomic_write_text, res
 from dlss5_enabler.core.util import get_global_index_path
 from dlss5_enabler.core.version import get_tool_version
 from dlss5_enabler.schemas import migrations
-from dlss5_enabler.schemas.strategy import InstallStrategy
+from dlss5_enabler.schemas.strategy import FrameGenerationMode, GpuGeneration, InstallStrategy, NrPlacement
 
 CURRENT_RECORD_SCHEMA_VERSION = migrations.CURRENT_RECORD_SCHEMA_VERSION
 
@@ -126,6 +126,10 @@ class OptiScalerStrategyOptions(BaseModel):
     proxy_name: str
     nr_passes: int = Field(default=1, ge=1, le=5, strict=True)
     source_revision: str = Field(min_length=1)
+    frame_generation: FrameGenerationMode = FrameGenerationMode.OFF
+    fg_multiplier: int = Field(default=2, ge=2, le=6, strict=True)
+    nr_placement: NrPlacement = NrPlacement.AFTER
+    gpu_generation: GpuGeneration = "unknown"
 
     @field_validator("proxy_name")
     @classmethod
@@ -148,6 +152,14 @@ class OptiScalerStrategyOptions(BaseModel):
         if not value.strip() or value != value.strip():
             raise ValueError("OptiScaler source_revision must be nonempty and have no surrounding whitespace")
         return value
+
+    @model_validator(mode="after")
+    def validate_concrete_frame_generation(self) -> "OptiScalerStrategyOptions":
+        if self.frame_generation is FrameGenerationMode.AUTO:
+            raise ValueError("Recorded OptiScaler frame_generation must be concrete")
+        if self.frame_generation is not FrameGenerationMode.DLSSG and self.fg_multiplier != 2:
+            raise ValueError("Only DLSSG supports a configurable frame-generation multiplier")
+        return self
 
 
 StrategyOptions = Annotated[RenoDxStrategyOptions | OptiScalerStrategyOptions, Field(discriminator="kind")]

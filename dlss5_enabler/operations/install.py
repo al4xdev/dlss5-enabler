@@ -7,7 +7,7 @@ from dlss5_enabler.operations.contexts import OptiScalerContext, RenoDxContext
 from dlss5_enabler.operations.optiscaler import build_optiscaler_pipeline
 from dlss5_enabler.operations.pipeline import PipelineContext, PipelineResult, PipelineRunner
 from dlss5_enabler.operations.renodx import build_renodx_pipeline
-from dlss5_enabler.schemas.strategy import InstallStrategy
+from dlss5_enabler.schemas.strategy import FrameGenerationMode, InstallStrategy, NrPlacement
 
 __all__ = [
     "build_install_pipeline",
@@ -36,6 +36,9 @@ def run_install(
     optiscaler_archive: Path | None = None,
     optiscaler_nr_passes: int = 1,
     optiscaler_proxy: str = "dxgi.dll",
+    optiscaler_frame_generation: FrameGenerationMode = FrameGenerationMode.AUTO,
+    optiscaler_fg_multiplier: int = 2,
+    optiscaler_nr_placement: NrPlacement = NrPlacement.AFTER,
 ) -> bool:
     game_exe = Path(game_exe_path).resolve()
     with resource_lock(game_exe.parent / ".dlss5-enabler-install-operation"):
@@ -51,6 +54,9 @@ def run_install(
             optiscaler_archive=optiscaler_archive,
             optiscaler_nr_passes=optiscaler_nr_passes,
             optiscaler_proxy=optiscaler_proxy,
+            optiscaler_frame_generation=optiscaler_frame_generation,
+            optiscaler_fg_multiplier=optiscaler_fg_multiplier,
+            optiscaler_nr_placement=optiscaler_nr_placement,
         ).success
 
 
@@ -67,6 +73,9 @@ def _run_install_unlocked(
     optiscaler_source_revision: str = "",
     optiscaler_nr_passes: int = 1,
     optiscaler_proxy: str = "dxgi.dll",
+    optiscaler_frame_generation: FrameGenerationMode = FrameGenerationMode.AUTO,
+    optiscaler_fg_multiplier: int = 2,
+    optiscaler_nr_placement: NrPlacement = NrPlacement.AFTER,
 ) -> PipelineResult:
     game_exe = Path(game_exe_path).resolve()
     selected = InstallStrategy(strategy)
@@ -80,6 +89,9 @@ def _run_install_unlocked(
             source_revision=optiscaler_source_revision,
             nr_passes=optiscaler_nr_passes,
             proxy_name=optiscaler_proxy,
+            frame_generation=optiscaler_frame_generation,
+            fg_multiplier=optiscaler_fg_multiplier,
+            nr_placement=optiscaler_nr_placement,
         )
         return build_optiscaler_pipeline().run_result(optiscaler_ctx)
     ctx = RenoDxContext(

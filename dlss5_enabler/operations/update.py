@@ -14,7 +14,7 @@ from dlss5_enabler.core.record import (
 from dlss5_enabler.core.version import InstallVersionStatus, get_install_version_status, get_tool_version
 from dlss5_enabler.operations.install import _run_install_unlocked
 from dlss5_enabler.operations.pipeline import PipelineResult, PipelineStatus
-from dlss5_enabler.schemas.strategy import InstallStrategy
+from dlss5_enabler.schemas.strategy import FrameGenerationMode, InstallStrategy, NrPlacement
 
 LogFn = Callable[[str], None]
 
@@ -111,6 +111,9 @@ def run_update(
     optiscaler_archive: Path | None = None,
     optiscaler_nr_passes: int | None = None,
     optiscaler_proxy: str | None = None,
+    optiscaler_frame_generation: FrameGenerationMode | None = None,
+    optiscaler_fg_multiplier: int | None = None,
+    optiscaler_nr_placement: NrPlacement | None = None,
 ) -> GameUpdateResult:
     target = Path(game_dir_or_exe).resolve()
     game_dir = _find_record_directory(target)
@@ -131,7 +134,15 @@ def run_update(
         selected = InstallStrategy(strategy) if strategy is not None else record.strategy
         explicitly_selected = strategy is not None
         optiscaler_options_requested = any(
-            value is not None for value in (optiscaler_archive, optiscaler_nr_passes, optiscaler_proxy)
+            value is not None
+            for value in (
+                optiscaler_archive,
+                optiscaler_nr_passes,
+                optiscaler_proxy,
+                optiscaler_frame_generation,
+                optiscaler_fg_multiplier,
+                optiscaler_nr_placement,
+            )
         )
         selection = _selection_result(
             record,
@@ -158,10 +169,20 @@ def run_update(
         source_revision = ""
         nr_passes = optiscaler_nr_passes if optiscaler_nr_passes is not None else 1
         proxy = optiscaler_proxy or "dxgi.dll"
+        frame_generation = optiscaler_frame_generation or FrameGenerationMode.AUTO
+        fg_multiplier = optiscaler_fg_multiplier if optiscaler_fg_multiplier is not None else 2
+        nr_placement = optiscaler_nr_placement or NrPlacement.AFTER
         if selected is InstallStrategy.OPTISCALER and isinstance(record.strategy_options, OptiScalerStrategyOptions):
             source_revision = record.strategy_options.source_revision
             nr_passes = optiscaler_nr_passes if optiscaler_nr_passes is not None else record.strategy_options.nr_passes
             proxy = optiscaler_proxy or record.strategy_options.proxy_name
+            frame_generation = optiscaler_frame_generation or record.strategy_options.frame_generation
+            fg_multiplier = (
+                optiscaler_fg_multiplier
+                if optiscaler_fg_multiplier is not None
+                else record.strategy_options.fg_multiplier
+            )
+            nr_placement = optiscaler_nr_placement or record.strategy_options.nr_placement
         if selected is InstallStrategy.RENODX and isinstance(record.strategy_options, RenoDxStrategyOptions):
             options = record.strategy_options.as_install_options()
         log(
@@ -181,6 +202,9 @@ def run_update(
                 optiscaler_source_revision=source_revision,
                 optiscaler_nr_passes=nr_passes,
                 optiscaler_proxy=proxy,
+                optiscaler_frame_generation=frame_generation,
+                optiscaler_fg_multiplier=fg_multiplier,
+                optiscaler_nr_placement=nr_placement,
             )
         else:
             installation = _run_install_unlocked(

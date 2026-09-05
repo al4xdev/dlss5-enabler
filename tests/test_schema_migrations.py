@@ -15,7 +15,7 @@ from dlss5_enabler.core.record import (
 )
 from dlss5_enabler.schemas import migrations
 from dlss5_enabler.schemas.migrations import CURRENT_RECORD_SCHEMA_VERSION, migrate_record
-from dlss5_enabler.schemas.strategy import InstallStrategy
+from dlss5_enabler.schemas.strategy import FrameGenerationMode, InstallStrategy, NrPlacement
 
 
 def _legacy_record() -> dict[str, object]:
@@ -275,7 +275,7 @@ def test_schema_three_migrates_options_and_preserves_all_existing_identity_and_m
     assert source == original
     assert migrated == {
         **original,
-        "schema_version": 4,
+        "schema_version": CURRENT_RECORD_SCHEMA_VERSION,
         "strategy_options": {"kind": "renodx", **record.install_options.model_dump()},
     }
     assert isinstance(record.strategy_options, RenoDxStrategyOptions)
@@ -297,7 +297,7 @@ def test_schema_three_record_load_does_not_write_disk(tmp_path: Path) -> None:
     record = record_load(tmp_path)
 
     assert record is not None
-    assert record.schema_version == 4
+    assert record.schema_version == CURRENT_RECORD_SCHEMA_VERSION
     assert record.strategy_options == RenoDxStrategyOptions(lumenite=False)
     assert record.install_options == InstallOptions(lumenite=False)
     assert path.read_bytes() == original
@@ -428,6 +428,46 @@ def test_optiscaler_record_round_trip_keeps_source_variant_and_specific_options(
     assert loaded == record
     serialized = record.model_dump(mode="json")
     assert migrate_record(serialized) == serialized
+
+
+def test_schema_four_optiscaler_migrates_new_options_without_changing_old_behavior(tmp_path: Path) -> None:
+    record = InstallRecord(
+        schema_version=CURRENT_RECORD_SCHEMA_VERSION,
+        strategy=InstallStrategy.OPTISCALER,
+        strategy_options=OptiScalerStrategyOptions(proxy_name="dxgi.dll", source_revision="d" * 64),
+        game_exe=(tmp_path / "game.exe").as_posix(),
+        game_dir=tmp_path.as_posix(),
+    )
+    source = record.model_dump(mode="json")
+    source["schema_version"] = 4
+    options = source["strategy_options"]
+    assert isinstance(options, dict)
+    for key in ("frame_generation", "fg_multiplier", "nr_placement", "gpu_generation"):
+        options.pop(key)
+
+    migrated = InstallRecord.model_validate(migrate_record(source))
+
+    assert isinstance(migrated.strategy_options, OptiScalerStrategyOptions)
+    assert migrated.strategy_options.frame_generation is FrameGenerationMode.OFF
+    assert migrated.strategy_options.fg_multiplier == 2
+    assert migrated.strategy_options.nr_placement is NrPlacement.AFTER
+    assert migrated.strategy_options.gpu_generation == "unknown"
+
+
+def test_optiscaler_record_rejects_auto_and_non_dlssg_multiplier() -> None:
+    with pytest.raises(ValidationError, match="must be concrete"):
+        OptiScalerStrategyOptions(
+            proxy_name="dxgi.dll",
+            source_revision="a" * 64,
+            frame_generation=FrameGenerationMode.AUTO,
+        )
+    with pytest.raises(ValidationError, match="Only DLSSG"):
+        OptiScalerStrategyOptions(
+            proxy_name="dxgi.dll",
+            source_revision="a" * 64,
+            frame_generation=FrameGenerationMode.FSR,
+            fg_multiplier=3,
+        )
 
 
 def test_optiscaler_creation_requires_explicit_current_schema() -> None:

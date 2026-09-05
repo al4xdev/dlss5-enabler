@@ -4,6 +4,7 @@ from pathlib import Path
 from dlss5_enabler.core.pe import PeArch
 from dlss5_enabler.network.sources import (
     DgvoodooBundle,
+    DlssgBundle,
     FeederBundle,
     LumeniteBundle,
     NgxBundle,
@@ -13,6 +14,7 @@ from dlss5_enabler.network.sources import (
     ReshadeHeaders,
 )
 from dlss5_enabler.operations.pipeline import PipelineContext
+from dlss5_enabler.schemas.strategy import FrameGenerationMode, GpuGeneration, NrPlacement
 
 
 @dataclass
@@ -46,7 +48,12 @@ class OptiScalerContext(PipelineContext):
     source_revision: str = ""
     nr_passes: int = 1
     proxy_name: str = "dxgi.dll"
+    frame_generation: FrameGenerationMode = FrameGenerationMode.AUTO
+    fg_multiplier: int = 2
+    nr_placement: NrPlacement = NrPlacement.AFTER
+    gpu_generation: GpuGeneration = "unknown"
     bundle: OptiScalerBundle | None = None
     ngx_bundle: NgxBundle | None = None
+    dlssg_bundle: DlssgBundle | None = None
     staging_directory: Path | None = None
     staged_files: dict[str, Path] = field(default_factory=dict[str, Path])

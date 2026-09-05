@@ -1,3 +1,3 @@
-from dlss5_enabler.schemas.strategy import InstallStrategy
+from dlss5_enabler.schemas.strategy import FrameGenerationMode, GpuGeneration, InstallStrategy, NrPlacement
 
-__all__ = ["InstallStrategy"]
+__all__ = ["FrameGenerationMode", "GpuGeneration", "InstallStrategy", "NrPlacement"]

@@ -149,6 +149,14 @@ class OptiScalerBundle:
         self.warnings: tuple[ResolutionWarning, ...] = ()
 
 
+class DlssgBundle:
+    def __init__(self) -> None:
+        self.version: str = ""
+        self.dll_path: Path | None = None
+        self.binaries: dict[str, BinaryInfo] = {}
+        self.warnings: tuple[ResolutionWarning, ...] = ()
+
+
 def fetch_optiscaler(
     log: LogFn,
     progress: ProgressFn | None = None,
@@ -197,6 +205,23 @@ def fetch_optiscaler(
         size_bytes=cache_path.stat().st_size,
         source_revision=revision,
     )
+    return out
+
+
+def fetch_dlssg(log: LogFn, progress: ProgressFn | None = None, force: bool = False) -> DlssgBundle:
+    cache_dir = get_cache_dir()
+    manifest_result = _resolve_rhi_manifest(log, cache_dir, progress, force)
+    manifest = RhiManifestPayload.model_validate_json(manifest_result.path.read_bytes())
+    if not manifest.dlssg:
+        raise ValueError("RHI manifest does not publish a DLSS Frame Generation runtime")
+    entry = max(manifest.dlssg, key=lambda item: _version_key(item.version))
+    result = _resolve_ngx("ngx_fg", entry, cache_dir / "nvngx_dlssg.zip", log, progress, force)
+    dll_path = zip_extract_matching(result.path, cache_dir, ["*nvngx_dlssg.dll"], flatten=True)[0]
+    out = DlssgBundle()
+    out.version = result.revision.removeprefix("dlssg-")
+    out.dll_path = dll_path
+    out.warnings = manifest_result.warnings + result.warnings
+    out.binaries["nvngx_dlssg.dll"] = _binary(dll_path, "nvngx_dlssg.dll", result)
     return out
 
 

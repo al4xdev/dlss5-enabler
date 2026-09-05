@@ -16,6 +16,7 @@ EXPECTED_COMPONENTS = frozenset(
         "rhi_manifest",
         "ngx_nr",
         "ngx_sr",
+        "ngx_fg",
         "reshade_headers",
         "lumenite",
         "dgvoodoo2",
@@ -200,6 +201,7 @@ class RhiManifestPayload(ManifestModel):
 
     dlssnr: tuple[RhiManifestEntry, ...] = Field(min_length=1)
     dlss: tuple[RhiManifestEntry, ...] = Field(min_length=1)
+    dlssg: tuple[RhiManifestEntry, ...] = ()
 
 
 def _require_https(value: str) -> str:

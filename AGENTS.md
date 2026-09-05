@@ -96,7 +96,7 @@ Mypy and Pyright run in strict mode.
 
 ### 4.4 Record schemas and migrations
 
-- Installation records use schema 4. Each change adds `schemas/migrations/vN_to_vNplus1.py`, registers its `migrate(data: dict[str, object]) -> dict[str, object]` function in the migration runner, and increments `CURRENT_RECORD_SCHEMA_VERSION` there.
+- Installation records use schema 5. Each change adds `schemas/migrations/vN_to_vNplus1.py`, registers its `migrate(data: dict[str, object]) -> dict[str, object]` function in the migration runner, and increments `CURRENT_RECORD_SCHEMA_VERSION` there.
 - Keep historical transitions. Each migration advances exactly one version, operates on a copy, and performs no filesystem or network access. Test every supported starting version through the current schema, plus malformed and future versions.
 - Missing schema means legacy version 1. Reading migrates only in memory; normal transactional saving revalidates and persists the current schema. Never rewrite a game record merely to inspect it.
 - Persist the concrete strategy and requested options. Do not infer ownership of legacy runtime files from their names when no inventory was recorded.

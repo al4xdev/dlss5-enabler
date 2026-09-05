@@ -11,11 +11,12 @@ from dlss5_enabler.core.mutations import managed_file_lock, prepare_managed_path
 from dlss5_enabler.core.pe import DetectedApi, PeArch
 from dlss5_enabler.core.record import OptiScalerStrategyOptions
 from dlss5_enabler.core.util import get_cache_dir, sha256_file, unblock_file
-from dlss5_enabler.network.sources import fetch_ngx_dlls, fetch_optiscaler
+from dlss5_enabler.network.sources import fetch_dlssg, fetch_ngx_dlls, fetch_optiscaler
 from dlss5_enabler.operations.contexts import OptiScalerContext
 from dlss5_enabler.operations.pipeline import PipelineRunner, PipelineStep
 from dlss5_enabler.operations.steps_common import StepCleanPreviousInstall, StepSaveRecord, StepValidateTarget
-from dlss5_enabler.platform import get_platform_adapter
+from dlss5_enabler.platform import NvidiaGpuGeneration, detect_nvidia_gpu_generation, get_platform_adapter
+from dlss5_enabler.schemas.strategy import FrameGenerationMode, NrPlacement
 
 _REQUIRED_MEMBERS = frozenset({"optiscaler.dll", "optiscaler.ini", "nvngx.dll_dlssnr.dll"})
 _SKIPPED_MEMBERS = frozenset({"setup_windows.bat", "setup_linux.sh"})
@@ -80,6 +81,8 @@ def _install_destinations(ctx: OptiScalerContext) -> dict[str, Path]:
         for relative in ctx.staged_files
     }
     destinations["<nvidia-nr-runtime>"] = ctx.game_dir / "nvngx_dlssnr.dll"
+    if ctx.dlssg_bundle is not None:
+        destinations["<nvidia-fg-runtime>"] = ctx.game_dir / "OptiScaler" / "streamline" / "nvngx_dlssg.dll"
     canonical = [path.resolve() for path in destinations.values()]
     if len(canonical) != len(set(canonical)):
         raise ValueError("OptiScaler sources collide after mapping files into the game directory")
@@ -112,7 +115,22 @@ class StepConfigureOptiScaler(PipelineStep[OptiScalerContext]):
             error = f"Unsupported OptiScaler proxy name: {ctx.proxy_name}"
         elif not 1 <= ctx.nr_passes <= 5:
             error = "OptiScaler NR passes must be between 1 and 5."
+        elif not 2 <= ctx.fg_multiplier <= 6:
+            error = "OptiScaler frame-generation multiplier must be between 2 and 6."
         else:
+            ctx.frame_generation = FrameGenerationMode(ctx.frame_generation)
+            ctx.nr_placement = NrPlacement(ctx.nr_placement)
+            gpu = detect_nvidia_gpu_generation()
+            ctx.gpu_generation = gpu.generation.value
+            if ctx.frame_generation is FrameGenerationMode.AUTO:
+                ctx.frame_generation = FrameGenerationMode.FSR
+            if ctx.frame_generation is not FrameGenerationMode.DLSSG and ctx.fg_multiplier != 2:
+                error = "Only DLSSG supports a configurable frame-generation multiplier."
+            elif ctx.frame_generation is FrameGenerationMode.DLSSG and gpu.generation not in {
+                NvidiaGpuGeneration.RTX40,
+                NvidiaGpuGeneration.RTX50,
+            }:
+                error = "DLSSG output requires a detected GeForce RTX 40 or RTX 50 GPU. Use FSR output instead."
             reserved = next(
                 (
                     path
@@ -121,7 +139,7 @@ class StepConfigureOptiScaler(PipelineStep[OptiScalerContext]):
                 ),
                 None,
             )
-            if reserved is not None:
+            if not error and reserved is not None:
                 error = f"OptiScaler may delete reserved capture path; move it before installing: {reserved}"
         if error:
             ctx.error_message = error
@@ -146,10 +164,16 @@ class StepFetchOptiScaler(PipelineStep[OptiScalerContext]):
             source_revision=ctx.source_revision,
         )
         ctx.ngx_bundle = fetch_ngx_dlls(lambda _message: None, force=ctx.force_download, include_sr=False)
+        if ctx.frame_generation is FrameGenerationMode.DLSSG:
+            ctx.dlssg_bundle = fetch_dlssg(lambda _message: None, force=ctx.force_download)
         ctx.record.binaries.update(ctx.bundle.binaries)
         ctx.record.binaries.update(ctx.ngx_bundle.binaries)
+        if ctx.dlssg_bundle is not None:
+            ctx.record.binaries.update(ctx.dlssg_bundle.binaries)
         ctx.upstream_warnings.extend(ctx.bundle.warnings)
         ctx.upstream_warnings.extend(ctx.ngx_bundle.warnings)
+        if ctx.dlssg_bundle is not None:
+            ctx.upstream_warnings.extend(ctx.dlssg_bundle.warnings)
         return True
 
 
@@ -170,13 +194,34 @@ class StepPrepareOptiScaler(PipelineStep[OptiScalerContext]):
         ctx.staging_directory = Path(tempfile.mkdtemp(prefix="dlss5-enabler-optiscaler-", dir=get_cache_dir()))
         ctx.staged_files = _extract_archive(ctx.bundle.archive_path, ctx.staging_directory)
         ini_relative, ini_path = _find_unique(ctx.staged_files, "OptiScaler.ini")
+        before = ctx.nr_placement is NrPlacement.BEFORE
+        inside = ctx.nr_placement is NrPlacement.INSIDE
+        fg_enabled = ctx.frame_generation is not FrameGenerationMode.OFF
+        fg_output = "dlssg" if ctx.frame_generation is FrameGenerationMode.DLSSG else "fsrfg"
+        ada_profile = ctx.gpu_generation == NvidiaGpuGeneration.RTX40.value
         settings = (
             ("Upscalers", "Dx11Upscaler", "dlss_12"),
             ("Upscalers", "Dx12Upscaler", "dlss"),
             ("DlssNr", "Enabled", "true"),
             ("DlssNr", "Passes", str(ctx.nr_passes)),
+            ("DlssNr", "PreUpscale", "true" if before else "false"),
+            ("DlssNr", "DualFeature", "true" if inside else "false"),
+            ("DlssNr", "DualEnlarger", "dlss" if inside else "auto"),
             ("DlssNr", "AutoCapture", "false"),
-            ("FrameGen", "Enabled", "false"),
+            ("FrameGen", "Enabled", "true" if fg_enabled else "false"),
+            ("FrameGen", "FGInput", "upscaler" if fg_enabled else "nofg"),
+            ("FrameGen", "FGOutput", fg_output if fg_enabled else "nofg"),
+            ("FrameGen", "FGNvngxReplacement", "None"),
+            ("FrameGen", "FTInput", "1" if fg_enabled else "0"),
+            ("OptiFG", "HUDFix", "true" if fg_enabled else "false"),
+            ("OptiFG", "HUDFixImmediate", "true" if fg_enabled else "false"),
+            ("DLSSG", "InterpolationCount", str(ctx.fg_multiplier - 1)),
+            ("DLSSG", "OverrideInterpolationCount", "auto"),
+            ("DLSSG", "ForceDMFG", "false"),
+            ("DLSSG", "AdaMfgUnlock", "true" if ada_profile else "false"),
+            ("DLSSG", "AdaBlackwellKernels", "true" if ada_profile else "false"),
+            ("NvApi", "DisableFlipMetering", "true" if ada_profile else "false"),
+            ("NvApi", "DisableReflexSync", "false"),
             ("Menu", "ShortcutKey", "0x2E"),
             ("Log", "LogToFile", "true"),
             ("Log", "LogFileName", "OptiScaler.log"),
@@ -205,6 +250,9 @@ class StepPrepareOptiScaler(PipelineStep[OptiScalerContext]):
         nr_destination = destinations["<nvidia-nr-runtime>"]
         if nr_destination.exists() and nr_destination.resolve() not in previous_paths:
             raise ValueError(f"OptiScaler destination is occupied by an unmanaged path: {nr_destination}")
+        fg_destination = destinations.get("<nvidia-fg-runtime>")
+        if fg_destination is not None and fg_destination.exists() and fg_destination.resolve() not in previous_paths:
+            raise ValueError(f"OptiScaler destination is occupied by an unmanaged path: {fg_destination}")
         return True
 
     def rollback(self, ctx: OptiScalerContext) -> None:
@@ -246,6 +294,16 @@ class StepInstallOptiScaler(PipelineStep[OptiScalerContext]):
             unblock_file(nr_destination)
             item.size_bytes = nr_destination.stat().st_size
             item.sha256 = sha256_file(nr_destination)
+        if ctx.dlssg_bundle is not None:
+            fg_source = ctx.dlssg_bundle.dll_path
+            if fg_source is None or not fg_source.is_file():
+                raise ValueError("NVIDIA Frame Generation runtime is missing")
+            fg_destination = destinations["<nvidia-fg-runtime>"]
+            with managed_file_lock(ctx.record, fg_destination) as item:
+                _atomic_copy_file_unlocked(fg_source, fg_destination)
+                unblock_file(fg_destination)
+                item.size_bytes = fg_destination.stat().st_size
+                item.sha256 = sha256_file(fg_destination)
         prepare_managed_path(ctx.record, ctx.game_dir / "OptiScaler.log")
         ctx.record.install_type = "OptiScaler / native DLSS"
         ctx.record.native_dlss_detected = True
@@ -254,6 +312,10 @@ class StepInstallOptiScaler(PipelineStep[OptiScalerContext]):
             proxy_name=ctx.proxy_name,
             nr_passes=ctx.nr_passes,
             source_revision=ctx.bundle.source_revision,
+            frame_generation=ctx.frame_generation,
+            fg_multiplier=ctx.fg_multiplier,
+            nr_placement=ctx.nr_placement,
+            gpu_generation=ctx.gpu_generation,
         )
         return True
 
