@@ -7,6 +7,7 @@ from dlss5_enabler.core.fileio import resource_lock
 from dlss5_enabler.core.record import InstallOptions, InstallRecord, record_load
 from dlss5_enabler.core.version import InstallVersionStatus, get_install_version_status, get_tool_version
 from dlss5_enabler.operations.install import _run_install_unlocked
+from dlss5_enabler.operations.pipeline import PipelineResult, PipelineStatus
 
 LogFn = Callable[[str], None]
 
@@ -20,6 +21,7 @@ class GameUpdateStatus(str, Enum):
     RECORD_INVALID = "record_invalid"
     GAME_MISSING = "game_missing"
     FAILED = "failed"
+    RECOVERY_FAILED = "recovery_failed"
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,7 @@ class GameUpdateResult:
     previous_version: str = ""
     current_version: str = ""
     options: InstallOptions | None = None
+    installation: PipelineResult | None = None
 
     @property
     def success(self) -> bool:
@@ -114,7 +117,7 @@ def run_update(
             f"D3D9={'yes' if options.d3d9 else 'no'}, OpenGL={'yes' if options.opengl else 'no'}, "
             f"Vulkan={'yes' if options.vulkan_layer else 'no'}"
         )
-        success = _run_install_unlocked(
+        installation = _run_install_unlocked(
             game_exe,
             install_lumenite=options.lumenite,
             d3d9_translate=options.d3d9,
@@ -122,20 +125,36 @@ def run_update(
             install_vulkan_layer=options.vulkan_layer,
             force_download=force_download,
             verbose=verbose,
+            strategy=record.strategy,
         )
-        if not success:
+        if not installation.success:
+            recovery_failed = installation.status is PipelineStatus.RECOVERY_FAILED
+            message = (
+                "Game update failed and recovery is incomplete. " + "; ".join(installation.recovery_errors)
+                if recovery_failed
+                else "Game update failed; the state from before this operation was restored."
+            )
+            if installation.message:
+                message += f" Cause: {installation.message}"
+            if installation.recovery_path:
+                message += f" Recovery snapshot: {installation.recovery_path}"
             return GameUpdateResult(
-                GameUpdateStatus.FAILED,
-                "Game update failed; the previous managed installation was restored.",
+                GameUpdateStatus.RECOVERY_FAILED if recovery_failed else GameUpdateStatus.FAILED,
+                message,
                 record.tool_version,
                 current_version,
                 options,
+                installation,
             )
         result_status = GameUpdateStatus.REINSTALLED if reinstall else GameUpdateStatus.UPDATED
+        message = f"Game installation now uses DLSS5 Enabler {current_version}; engine: {record.strategy.value}."
+        if installation.cleanup_errors:
+            message += " Installation is active; cleanup pending: " + "; ".join(installation.cleanup_errors)
         return GameUpdateResult(
             result_status,
-            f"Game installation now uses DLSS5 Enabler {current_version}.",
+            message,
             record.tool_version,
             current_version,
             options,
+            installation,
         )

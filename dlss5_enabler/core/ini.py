@@ -40,15 +40,19 @@ def _save_ini_document(path: Path, document: _IniDocument) -> None:
 
 
 def ini_get_exact(ini_path: Path | str, section: str, key: str) -> tuple[bool, str]:
+    try:
+        with resource_lock(ini_path):
+            return ini_get_exact_unlocked(ini_path, section, key)
+    except Exception:
+        return False, ""
+
+
+def ini_get_exact_unlocked(ini_path: Path | str, section: str, key: str) -> tuple[bool, str]:
     path = Path(ini_path)
     if not path.is_file():
         return False, ""
 
-    try:
-        with resource_lock(path):
-            document = _load_ini_document(path)
-    except Exception:
-        return False, ""
+    document = _load_ini_document(path)
     if document is None:
         return False, ""
 
@@ -74,61 +78,68 @@ def ini_get_exact(ini_path: Path | str, section: str, key: str) -> tuple[bool, s
 
 
 def ini_set_exact(ini_path: Path | str, section: str, key: str, value: str) -> bool:
+    try:
+        with resource_lock(ini_path):
+            return ini_set_exact_unlocked(ini_path, section, key, value)
+    except Exception:
+        return False
+
+
+def ini_set_exact_unlocked(ini_path: Path | str, section: str, key: str, value: str) -> bool:
     path = Path(ini_path)
     try:
-        with resource_lock(path):
-            if path.is_file():
-                document = _load_ini_document(path)
-                if document is None:
-                    return False
-            else:
-                document = _IniDocument(lines=[], newline="\n", trailing_newline=True, has_bom=False)
+        if path.is_file():
+            document = _load_ini_document(path)
+            if document is None:
+                return False
+        else:
+            document = _IniDocument(lines=[], newline="\n", trailing_newline=True, has_bom=False)
 
-            section_pattern = re.compile(rf"^\s*\[{re.escape(section)}\]\s*$", re.IGNORECASE)
-            any_section_pattern = re.compile(r"^\s*\[.*\]\s*$")
+        section_pattern = re.compile(rf"^\s*\[{re.escape(section)}\]\s*$", re.IGNORECASE)
+        any_section_pattern = re.compile(r"^\s*\[.*\]\s*$")
 
-            in_target_section = False
-            section_found = False
-            key_found = False
-            new_lines: list[str] = []
-            inserted = False
+        in_target_section = False
+        section_found = False
+        key_found = False
+        new_lines: list[str] = []
+        inserted = False
 
-            for line in document.lines:
-                stripped = line.strip()
-                if any_section_pattern.match(stripped):
-                    if in_target_section and not key_found and value:
+        for line in document.lines:
+            stripped = line.strip()
+            if any_section_pattern.match(stripped):
+                if in_target_section and not key_found and value:
+                    new_lines.append(f"{key}={value}")
+                    inserted = True
+                    key_found = True
+                in_target_section = bool(section_pattern.match(stripped))
+                if in_target_section:
+                    section_found = True
+                new_lines.append(line)
+                continue
+
+            if in_target_section and "=" in line and not stripped.startswith((";", "#")):
+                k, _ = line.split("=", 1)
+                if k.strip() == key:
+                    key_found = True
+                    if value:
                         new_lines.append(f"{key}={value}")
-                        inserted = True
-                        key_found = True
-                    in_target_section = bool(section_pattern.match(stripped))
-                    if in_target_section:
-                        section_found = True
-                    new_lines.append(line)
                     continue
 
-                if in_target_section and "=" in line and not stripped.startswith((";", "#")):
-                    k, _ = line.split("=", 1)
-                    if k.strip() == key:
-                        key_found = True
-                        if value:
-                            new_lines.append(f"{key}={value}")
-                        continue
+            new_lines.append(line)
 
-                new_lines.append(line)
+        if in_target_section and not key_found and value and not inserted:
+            new_lines.append(f"{key}={value}")
+            key_found = True
 
-            if in_target_section and not key_found and value and not inserted:
-                new_lines.append(f"{key}={value}")
-                key_found = True
+        if not section_found and value:
+            if new_lines and new_lines[-1].strip():
+                new_lines.append("")
+            new_lines.append(f"[{section}]")
+            new_lines.append(f"{key}={value}")
 
-            if not section_found and value:
-                if new_lines and new_lines[-1].strip():
-                    new_lines.append("")
-                new_lines.append(f"[{section}]")
-                new_lines.append(f"{key}={value}")
-
-            document.lines = new_lines
-            path.parent.mkdir(parents=True, exist_ok=True)
-            _save_ini_document(path, document)
+        document.lines = new_lines
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _save_ini_document(path, document)
         return True
     except Exception:
         return False

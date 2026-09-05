@@ -36,9 +36,12 @@ dlss5_enabler/
 │   ├── http.py           streaming HTTP, classified retries, deadline, and curl
 │   └── sources.py        component resolution, caching, download, and extraction
 ├── operations/
-│   ├── install.py        installation pipeline composition
+│   ├── install.py        concrete strategy selection
+│   ├── contexts.py       RenoDX-specific options and artifacts
+│   ├── renodx.py         explicit RenoDX pipeline composition
+│   ├── steps_common.py   analysis, snapshots, and record finalization
 │   ├── pipeline.py       context, steps, commit, and rollback
-│   ├── reshade.py        headless ReShade installation and extraction
+│   ├── reshade.py        isolated extraction and managed INI updates
 │   ├── steps.py          isolated installation steps
 │   └── uninstall.py      transactional removal and restoration
 ├── platform/
@@ -46,6 +49,7 @@ dlss5_enabler/
 │   ├── linux.py          XDG, permissions, and POSIX paths
 │   ├── proton.py         prefix discovery and user.reg handling
 │   └── windows.py        LocalAppData and Zone.Identifier handling
+├── schemas/              strategy models and chained schema migrations
 ├── check.py              unified quality orchestrator
 └── cli.py                Typer interface
 ```
@@ -88,7 +92,15 @@ Mypy and Pyright run in strict mode.
 - Persist paths in canonical POSIX form with `.as_posix()`.
 - Do not assume archive separators match the host platform. Normalize both `/` and `\` before matching.
 
-### 4.4 Files, locks, and rollback
+### 4.4 Record schemas and migrations
+
+- Installation records use schema 3. Each change adds `schemas/migrations/vN_to_vNplus1.py`, registers its `migrate(data: dict[str, object]) -> dict[str, object]` function in the migration runner, and increments `CURRENT_RECORD_SCHEMA_VERSION` there.
+- Keep historical transitions. Each migration advances exactly one version, operates on a copy, and performs no filesystem or network access. Test every supported starting version through the current schema, plus malformed and future versions.
+- Missing schema means legacy version 1. Reading migrates only in memory; normal transactional saving revalidates and persists the current schema. Never rewrite a game record merely to inspect it.
+- Persist the concrete strategy and requested options. Do not infer ownership of legacy runtime files from their names when no inventory was recorded.
+- Global index snapshots preserve original bytes and absence; recovery merges only the affected game when unrelated entries changed concurrently.
+
+### 4.5 Files, locks, and rollback
 
 - Use the helpers in `core/fileio.py` for shared resources, atomic writes, copies, and backups.
 - Keep every shared read-modify-write sequence under the same lock.
@@ -96,7 +108,10 @@ Mypy and Pyright run in strict mode.
 - Preserve a known-good destination when refresh, download, validation, or installation fails.
 - Extract archives only through `safe_archive_destination()` or helpers that use it.
 - Reject absolute paths, `..`, destination escapes, and collisions caused by flattening.
-- A new pipeline step must implement error handling, rollback, and commit behavior consistent with its mutations.
+- Common pipeline steps receive `PipelineContext`; RenoDX steps receive `RenoDxContext`. Keep rendering-specific state out of the common context.
+- A new pipeline step must implement error handling, rollback, and commit behavior consistent with its mutations. `commit()` is critical finalization and may trigger rollback; `cleanup()` runs after commitment and must only discard temporary state.
+- Stage and validate every selected artifact before removing an existing installation. ReShade setup is extracted in staging and never executed by the installation pipeline.
+- Use `core/mutations.py` to snapshot files before editing, register newly created directories, and inventory owned runtime artifacts. Keep original bytes when updating existing INIs.
 - When a step fails, test residual state and restoration, not only its boolean return value.
 
 ## 5. Network, upstreams, and cache

@@ -45,9 +45,9 @@ macOS is a CI portability target for the Python, archive, cache, and packaging l
 
 The project is built to fail safely when downloads, permissions, extraction, or configuration do not behave as expected.
 
-- **Transactional installation:** all 12 stages participate in rollback, including the stage that reports the failure.
+- **Transactional installation:** all installation stages and critical finalization steps participate in rollback, including the stage that reports the failure.
 - **Recoverable refreshes:** an existing managed installation is snapshotted before replacement and restored if the new installation fails.
-- **Safe uninstallation:** original DLLs, INI values, and Wine registry values are restored before metadata is removed.
+- **Safe uninstallation:** original DLLs and backed-up INI bytes are restored before metadata is removed; Wine registry changes restore the recorded original values.
 - **Atomic writes:** records, indexes, cache metadata, registry files, and INI files are written through a temporary file followed by replacement.
 - **Concurrent-operation locks:** per-game operations and shared state use filesystem locks to prevent overlapping writes.
 - **Non-destructive backups:** existing files receive unique backup names; an older backup is never silently overwritten.
@@ -179,7 +179,11 @@ dlss5-enabler update "/path/to/game.exe"
 dlss5-enabler update Control_DX12.exe
 ```
 
-`update` reads the installation metadata beside the game, then transactionally reapplies the same LumeniteFX, D3D9, OpenGL, and Vulkan choices with the components managed by the current CLI. Use `--reinstall` to reapply an already-current installation or `--force-download` to bypass component caches. A game installed by a newer CLI is never downgraded.
+`update` preserves the recorded installation engine and the same LumeniteFX, D3D9, OpenGL, and Vulkan choices. RenoDX is the supported engine in this release. Update eligibility compares the installed Enabler version with the running CLI; it does not check upstream component versions when those Enabler versions match. Use `--reinstall` to resolve and reapply components with the current CLI, and add `--force-download` to bypass caches. `--force-download` alone does not bypass the version check. A game installed by a newer CLI is never downgraded.
+
+Installation records use schema 3. Older supported records migrate in memory through each schema version, and successful installation or update saves the current schema. Inspecting a game does not rewrite its record. Unknown future schemas, malformed records, and unknown engines are rejected and preserved.
+
+If recovery cannot finish, the command reports incomplete recovery and retains a snapshot directory containing `recovery.json` and saved files. Keep that directory for recovery. A separate cleanup warning means installation committed successfully but a temporary staging or recovery directory could not be removed.
 
 ### Uninstall
 
@@ -221,22 +225,26 @@ dlss5-enabler version --check
 
 ## Installation pipeline
 
-An installation runs these stages in order:
+The RenoDX pipeline separates target analysis, component selection, preparation, and game mutations:
 
-1. Validate the executable, architecture, graphics API hints, permissions, and requested mode.
-2. Discover, download, and validate every required upstream component.
-3. Snapshot and remove a previous managed installation when refreshing.
-4. Install or extract the correct ReShade Addon DLL.
-5. Configure dgVoodoo2 when DirectX 9 translation is requested.
-6. Place the Feeder addon, shader, and ReShade headers.
-7. Place RenoDX and the architecture-appropriate NGX binaries.
-8. Place LumeniteFX and configure its motion-vector provider.
-9. Install the Vulkan fallback when requested and available.
-10. Mirror managed files into `bin/` for layouts that require it.
-11. Apply Wine or Proton DLL overrides while recording their prior values.
-12. Atomically save `dlss5-enabler.install.json` and update the global index.
+1. Validate the executable and collect architecture, API hints, and native DLSS evidence.
+2. Select the RenoDX components and proxy.
+3. Discover, download, and validate required upstream components.
+4. Validate the selected files and extract ReShade into isolated staging.
+5. Snapshot and remove a previous managed installation when refreshing.
+6. Place the correct ReShade Addon DLL and configure its INI.
+7. Configure dgVoodoo2 when DirectX 9 translation is requested.
+8. Place Feeder when needed and the ReShade shader headers.
+9. Place RenoDX and the architecture-appropriate NGX binaries.
+10. Place LumeniteFX and configure its motion-vector provider.
+11. Install the Vulkan fallback when requested and available.
+12. Mirror managed files into `bin/` for layouts that require it.
+13. Apply Wine/Proton DLL overrides when applicable.
+14. Save the installation record and update the global index.
 
-If a stage fails, recorded mutations are reversed and any previous managed installation snapshot is restored.
+ReShade installation extracts the official package without executing its setup program. File placement and configuration changes go through the Enabler transaction. Critical finalization completes before recovery snapshots are discarded.
+
+New installations record created directories and runtime artifacts, including preexisting files that cleanup must preserve. Older records lack some of that ownership information, so untracked legacy logs, screenshots, or empty directories are preserved. Legacy INI entries without whole-file backups can restore only their recorded values; schema migration cannot reconstruct original bytes that were never saved.
 
 ## Upstream fallback policy
 
@@ -262,7 +270,8 @@ The log file is named `dlss5-enabler.log`.
 dlss5_enabler/
 ├── core/          Binary inspection, exact-case INI handling, records, atomic I/O
 ├── network/       HTTPS downloads, release discovery, cache validation
-├── operations/    Transactional install, update, and uninstall pipelines
+├── operations/    Typed RenoDX pipeline, shared transactions, update, and uninstall
+├── schemas/       Versioned records and chained Python migrations
 ├── platform/      Windows, experimental Linux, Wine, Proton, and Steam discovery adapters
 ├── check.py       Unified quality runner
 └── cli.py         Typer command-line interface
@@ -284,8 +293,8 @@ flowchart TB
     cli --> platform_contract
 
     subgraph operations["Transactional operations"]
-        install["install"] --> pipeline["12-stage installation pipeline<br/>validate · preflight · apply · record · commit"]
-        update["update"] -->|"reuse saved options"| pipeline
+        install["install"] --> pipeline["RenoDX installation pipeline<br/>validate · preflight · apply · record · commit"]
+        update["update"] -->|"reuse saved engine and options"| pipeline
         uninstall["uninstall"] --> recovery["Snapshot and recorded-mutation reversion"]
         pipeline -->|"any stage fails"| rollback["Reverse-order rollback"]
         rollback --> recovery

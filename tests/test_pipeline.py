@@ -5,15 +5,20 @@ from unittest.mock import Mock
 
 import py7zr
 import pytest
+from pydantic import ValidationError
 from pytest_mock import MockerFixture
 
 from dlss5_enabler.core.pe import IMAGE_DOS_SIGNATURE, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386, PeArch
 from dlss5_enabler.core.record import (
+    CURRENT_RECORD_SCHEMA_VERSION,
     IniTouch,
     InstallOptions,
     InstallRecord,
     RecordedFile,
     RegistryTouch,
+    RuntimeArtifacts,
+    index_add,
+    index_load,
     record_load,
     record_save,
 )
@@ -27,16 +32,17 @@ from dlss5_enabler.network.sources import (
     ReshadeBundle,
     ReshadeHeaders,
 )
+from dlss5_enabler.operations.contexts import RenoDxContext
 from dlss5_enabler.operations.install import build_install_pipeline, run_install
-from dlss5_enabler.operations.pipeline import PipelineContext, PipelineRunner, PipelineStep
+from dlss5_enabler.operations.pipeline import PipelineContext, PipelineRunner, PipelineStatus, PipelineStep
 from dlss5_enabler.operations.reshade import (
     ensure_mv_provider_def,
     extract_reshade_dlls_from_installer,
     normalize_search_paths,
 )
 from dlss5_enabler.operations.steps import (
-    StepCleanPreviousInstall,
     StepConfigureMotionVectors,
+    StepConfigureRenoDx,
     StepConfigureWineOverrides,
     StepFetchUpstream,
     StepInjectFeederAndHeaders,
@@ -45,16 +51,16 @@ from dlss5_enabler.operations.steps import (
     StepInstallReShade,
     StepInstallVulkanLayer,
     StepMirrorDualLocations,
-    StepSaveRecord,
-    StepValidateTarget,
     _place_file,
 )
+from dlss5_enabler.operations.steps_common import StepCleanPreviousInstall, StepSaveRecord, StepValidateTarget
 from dlss5_enabler.operations.uninstall import run_uninstall
 from dlss5_enabler.operations.update import GameUpdateStatus, run_update
 from dlss5_enabler.platform.proton import SteamPrefixInfo, WineRegParser
+from dlss5_enabler.schemas.strategy import InstallStrategy
 
 
-class DummySuccessStep(PipelineStep):
+class DummySuccessStep(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
         return "DummySuccess"
@@ -63,11 +69,11 @@ class DummySuccessStep(PipelineStep):
     def description(self) -> str:
         return "A dummy success step"
 
-    def execute(self, ctx: PipelineContext) -> bool:
+    def execute(self, ctx: RenoDxContext) -> bool:
         return True
 
 
-class DummyFailureStep(PipelineStep):
+class DummyFailureStep(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
         return "DummyFailure"
@@ -76,12 +82,12 @@ class DummyFailureStep(PipelineStep):
     def description(self) -> str:
         return "A dummy failure step"
 
-    def execute(self, ctx: PipelineContext) -> bool:
+    def execute(self, ctx: RenoDxContext) -> bool:
         ctx.error_message = "Deliberate failure"
         return False
 
 
-class DummyExceptionStep(PipelineStep):
+class DummyExceptionStep(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
         return "DummyException"
@@ -90,11 +96,11 @@ class DummyExceptionStep(PipelineStep):
     def description(self) -> str:
         return "A step that crashes"
 
-    def execute(self, ctx: PipelineContext) -> bool:
+    def execute(self, ctx: RenoDxContext) -> bool:
         raise RuntimeError("Crash in step")
 
 
-class DummyRollbackStep(PipelineStep):
+class DummyRollbackStep(PipelineStep[RenoDxContext]):
     def __init__(self) -> None:
         self.rolled_back = False
 
@@ -106,10 +112,10 @@ class DummyRollbackStep(PipelineStep):
     def description(self) -> str:
         return "A dummy step with rollback"
 
-    def execute(self, ctx: PipelineContext) -> bool:
+    def execute(self, ctx: RenoDxContext) -> bool:
         return True
 
-    def rollback(self, ctx: PipelineContext) -> None:
+    def rollback(self, ctx: RenoDxContext) -> None:
         self.rolled_back = True
 
 
@@ -129,8 +135,8 @@ def _mock_upstream_fetches(mocker: MockerFixture) -> dict[str, Mock]:
     }
 
 
-def _upstream_context(tmp_path: Path) -> PipelineContext:
-    ctx = PipelineContext(
+def _upstream_context(tmp_path: Path) -> RenoDxContext:
+    ctx = RenoDxContext(
         game_exe=tmp_path / "game.exe",
         d3d9_translate=True,
         install_lumenite=True,
@@ -163,7 +169,10 @@ def _synthetic_bundles(artifacts: Path) -> dict[str, object]:
         return path
 
     reshade = ReshadeBundle()
-    reshade.setup_exe_path = artifact("ReShade_Setup_Addon.exe")
+    reshade.setup_exe_path = artifacts / "ReShade_Setup_Addon.exe"
+    with zipfile.ZipFile(reshade.setup_exe_path, "w") as archive:
+        archive.writestr("ReShade32.dll", b"synthetic-reshade")
+        archive.writestr("ReShade64.dll", b"synthetic-reshade")
     feeder = FeederBundle()
     feeder.addon32 = artifact("dlss5-feed.addon32")
     feeder.addon64 = artifact("dlss5-feed.addon64")
@@ -189,7 +198,7 @@ def _synthetic_bundles(artifacts: Path) -> dict[str, object]:
 
 def test_pipeline_runner_success(tmp_path: Path) -> None:
     exe = tmp_path / "game.exe"
-    ctx = PipelineContext(game_exe=exe)
+    ctx = RenoDxContext(game_exe=exe)
 
     step1 = DummySuccessStep()
     step2 = DummySuccessStep()
@@ -201,7 +210,7 @@ def test_pipeline_runner_success(tmp_path: Path) -> None:
 
 
 def test_pipeline_success_summarizes_upstream_fallbacks(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    ctx = PipelineContext(game_exe=tmp_path / "game.exe")
+    ctx = RenoDxContext(game_exe=tmp_path / "game.exe")
     ctx.upstream_warnings.append(
         ResolutionWarning(
             code=ResolutionWarningCode.STABLE_FALLBACK_USED,
@@ -258,7 +267,7 @@ def test_d3d9_translation_disables_dgvoodoo_watermark(tmp_path: Path) -> None:
     bundle.d3d9_dll = d3d9_dll
     bundle.cpl = cpl
     bundle.conf = conf
-    ctx = PipelineContext(game_exe=tmp_path / "game.exe", d3d9_translate=True)
+    ctx = RenoDxContext(game_exe=tmp_path / "game.exe", d3d9_translate=True)
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.dgvoodoo_bundle = bundle
@@ -277,7 +286,7 @@ def test_native_dlss_installs_headers_without_feeder_components(tmp_path: Path) 
     for path in (headers.fxh_path, headers.ui_fxh_path, headers.drawtext_path):
         path.write_bytes(path.name.encode())
 
-    ctx = PipelineContext(game_exe=tmp_path / "game.exe", install_lumenite=True)
+    ctx = RenoDxContext(game_exe=tmp_path / "game.exe", install_lumenite=True)
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.install_feeder = False
@@ -304,7 +313,7 @@ def test_native_dlss_preserves_game_dlss_runtime(tmp_path: Path) -> None:
     ngx = NgxBundle()
     ngx.nr_dll_path = nr
     ngx.sr_dll_path = sr
-    ctx = PipelineContext(game_exe=tmp_path / "game.exe")
+    ctx = RenoDxContext(game_exe=tmp_path / "game.exe")
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.install_feeder = False
@@ -320,15 +329,17 @@ def test_native_dlss_preserves_game_dlss_runtime(tmp_path: Path) -> None:
     assert (tmp_path / "nvngx_dlssnr.dll").read_bytes() == b"NR"
 
 
-def test_32bit_host_uses_reshade_extraction_fallback(tmp_path: Path, mocker: MockerFixture) -> None:
+def test_32bit_host_extracts_x64_reshade_runtime(tmp_path: Path, mocker: MockerFixture) -> None:
     setup = tmp_path / "ReShade_Setup_Addon.exe"
     host_exe = tmp_path / "dlss5-feed-host64.exe"
     addon = tmp_path / "renodx-dlss5.addon64"
     nr_dll = tmp_path / "nvngx_dlssnr.dll"
     sr_dll = tmp_path / "nvngx_dlss.dll"
-    extracted_dll = tmp_path / "ReShade64.dll"
-    for path in (setup, host_exe, addon, nr_dll, sr_dll, extracted_dll):
+    for path in (host_exe, addon, nr_dll, sr_dll):
         path.write_bytes(path.name.encode())
+    with zipfile.ZipFile(setup, "w") as archive:
+        archive.writestr("ReShade64.dll", b"ReShade64.dll")
+        archive.writestr("ReShade32.dll", b"ReShade32.dll")
     reshade = ReshadeBundle()
     reshade.setup_exe_path = setup
     feeder = FeederBundle()
@@ -338,7 +349,7 @@ def test_32bit_host_uses_reshade_extraction_fallback(tmp_path: Path, mocker: Moc
     ngx = NgxBundle()
     ngx.nr_dll_path = nr_dll
     ngx.sr_dll_path = sr_dll
-    ctx = PipelineContext(game_exe=tmp_path / "game.exe")
+    ctx = RenoDxContext(game_exe=tmp_path / "game.exe")
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.is_32bit = True
@@ -348,11 +359,6 @@ def test_32bit_host_uses_reshade_extraction_fallback(tmp_path: Path, mocker: Moc
     ctx.ngx_bundle = ngx
     ctx.record = InstallRecord(game_exe=str(ctx.game_exe), game_dir=str(tmp_path))
     mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
-    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", return_value=False)
-    mocker.patch(
-        "dlss5_enabler.operations.steps.extract_reshade_dlls_from_installer",
-        return_value={"reshade64.dll": extracted_dll},
-    )
 
     assert StepInjectRenoDxAndNgx().execute(ctx)
     host_dir = tmp_path / "host64"
@@ -369,8 +375,10 @@ def test_32bit_host_missing_extraction_rolls_back(tmp_path: Path, mocker: Mocker
     addon = tmp_path / "renodx-dlss5.addon64"
     nr_dll = tmp_path / "nvngx_dlssnr.dll"
     sr_dll = tmp_path / "nvngx_dlss.dll"
-    for path in (setup, host_exe, addon, nr_dll, sr_dll):
+    for path in (host_exe, addon, nr_dll, sr_dll):
         path.write_bytes(path.name.encode())
+    with zipfile.ZipFile(setup, "w") as archive:
+        archive.writestr("ReShade32.dll", b"ReShade32.dll")
     reshade = ReshadeBundle()
     reshade.setup_exe_path = setup
     feeder = FeederBundle()
@@ -380,7 +388,7 @@ def test_32bit_host_missing_extraction_rolls_back(tmp_path: Path, mocker: Mocker
     ngx = NgxBundle()
     ngx.nr_dll_path = nr_dll
     ngx.sr_dll_path = sr_dll
-    ctx = PipelineContext(game_exe=tmp_path / "game.exe")
+    ctx = RenoDxContext(game_exe=tmp_path / "game.exe")
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.is_32bit = True
@@ -390,8 +398,6 @@ def test_32bit_host_missing_extraction_rolls_back(tmp_path: Path, mocker: Mocker
     ctx.ngx_bundle = ngx
     ctx.record = InstallRecord(game_exe=str(ctx.game_exe), game_dir=str(tmp_path))
     mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
-    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", return_value=False)
-    mocker.patch("dlss5_enabler.operations.steps.extract_reshade_dlls_from_installer", return_value={})
 
     assert not PipelineRunner([StepInjectRenoDxAndNgx()]).run(ctx)
     assert not (tmp_path / "host64").exists()
@@ -407,7 +413,7 @@ def test_native_dlss_keeps_lumenite_without_feeder_definition(tmp_path: Path) ->
     lumenite = LumeniteBundle()
     lumenite.staging_dir = staging
     lumenite.files = [source]
-    ctx = PipelineContext(game_exe=tmp_path / "game.exe", install_lumenite=True)
+    ctx = RenoDxContext(game_exe=tmp_path / "game.exe", install_lumenite=True)
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.install_feeder = False
@@ -445,7 +451,7 @@ def test_fetch_failure_does_not_mutate_existing_installation(tmp_path: Path, moc
     )
     record.record_path().write_bytes(record.model_dump_json().encode())
     original = {path: path.read_bytes() for path in (installed, ini, registry, record.record_path())}
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.record = InstallRecord(game_exe=game_exe.as_posix(), game_dir=tmp_path.as_posix())
@@ -453,7 +459,7 @@ def test_fetch_failure_does_not_mutate_existing_installation(tmp_path: Path, moc
     fetches["fetch_feeder"].side_effect = RuntimeError("both upstream candidates failed")
     clean = mocker.patch.object(StepCleanPreviousInstall, "execute")
 
-    assert not PipelineRunner([StepFetchUpstream(), StepCleanPreviousInstall()]).run(ctx)
+    assert not PipelineRunner[RenoDxContext]([StepFetchUpstream(), StepCleanPreviousInstall()]).run(ctx)
     clean.assert_not_called()
     assert {path: path.read_bytes() for path in original} == original
 
@@ -485,7 +491,7 @@ def test_step_fetch_upstream_propagates_every_fetch_failure(
 
 def test_pipeline_runner_failure_triggers_rollback(tmp_path: Path) -> None:
     exe = tmp_path / "game.exe"
-    ctx = PipelineContext(game_exe=exe)
+    ctx = RenoDxContext(game_exe=exe)
 
     step1 = DummyRollbackStep()
     step2 = DummyFailureStep()
@@ -499,7 +505,7 @@ def test_pipeline_runner_failure_triggers_rollback(tmp_path: Path) -> None:
 
 def test_pipeline_runner_exception_triggers_rollback(tmp_path: Path) -> None:
     exe = tmp_path / "game.exe"
-    ctx = PipelineContext(game_exe=exe)
+    ctx = RenoDxContext(game_exe=exe)
 
     step1 = DummyRollbackStep()
     step2 = DummyExceptionStep()
@@ -513,7 +519,7 @@ def test_pipeline_runner_exception_triggers_rollback(tmp_path: Path) -> None:
 
 def test_pipeline_runner_rollback_exception_resilience(tmp_path: Path, mocker: MockerFixture) -> None:
     exe = tmp_path / "game.exe"
-    ctx = PipelineContext(game_exe=exe)
+    ctx = RenoDxContext(game_exe=exe)
 
     step1 = DummyRollbackStep()
     mocker.patch.object(step1, "rollback", side_effect=Exception("Rollback error"))
@@ -529,47 +535,89 @@ def test_step_validate_target_success_x64(tmp_path: Path, mocker: MockerFixture)
     game_exe = tmp_path / "Control_DX12.exe"
     game_exe.write_bytes(b"MZ_DUMMY")
 
-    mocker.patch("dlss5_enabler.operations.steps.detect_pe_arch", return_value=PeArch.X64)
-    mocker.patch("dlss5_enabler.operations.steps.file_is_writable", return_value=True)
+    mocker.patch("dlss5_enabler.operations.steps_common.detect_pe_arch", return_value=PeArch.X64)
+    mocker.patch("dlss5_enabler.operations.steps_common.file_is_writable", return_value=True)
 
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
     step = StepValidateTarget()
 
     assert step.execute(ctx)
+    assert StepConfigureRenoDx().execute(ctx)
     assert ctx.pe_arch == PeArch.X64
     assert not ctx.is_32bit
     assert ctx.reshade_api == "dxgi"
     assert ctx.record.architecture == "x64"
 
 
-def test_step_validate_target_selects_direct_path_for_native_dlss(tmp_path: Path, mocker: MockerFixture) -> None:
+def test_renodx_configuration_selects_direct_path_after_native_dlss_analysis(
+    tmp_path: Path, mocker: MockerFixture
+) -> None:
     game_exe = tmp_path / "native_dlss.exe"
     game_exe.write_bytes(b"MZ_DUMMY")
 
-    mocker.patch("dlss5_enabler.operations.steps.detect_pe_arch", return_value=PeArch.X64)
-    mocker.patch("dlss5_enabler.operations.steps.detect_native_dlss", return_value=True)
-    mocker.patch("dlss5_enabler.operations.steps.file_is_writable", return_value=True)
+    mocker.patch("dlss5_enabler.operations.steps_common.detect_pe_arch", return_value=PeArch.X64)
+    mocker.patch("dlss5_enabler.operations.steps_common.detect_native_dlss", return_value=True)
+    mocker.patch("dlss5_enabler.operations.steps_common.file_is_writable", return_value=True)
 
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
 
     assert StepValidateTarget().execute(ctx)
+    assert ctx.analysis is not None
+    assert ctx.analysis.native_dlss
+    assert not bool(ctx.native_dlss_detected)
+    assert bool(ctx.install_feeder)
+    assert StepConfigureRenoDx().execute(ctx)
     assert ctx.native_dlss_detected
     assert not ctx.install_feeder
     assert ctx.record.lumenite_installed
     assert ctx.record.native_dlss_detected
 
 
+def test_common_analysis_preserves_unknown_proxy_without_selecting_renodx(tmp_path: Path) -> None:
+    game_exe = tmp_path / "game.exe"
+    game_exe.write_bytes(_synthetic_pe(IMAGE_FILE_MACHINE_AMD64))
+    proxy = tmp_path / "dxgi.dll"
+    proxy.write_bytes(b"unmanaged graphics hook")
+    original_files = {path.name: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()}
+    ctx = PipelineContext(game_exe=game_exe, strategy=InstallStrategy.RENODX)
+
+    assert StepValidateTarget().execute(ctx)
+
+    assert ctx.analysis is not None
+    assert ctx.analysis.architecture is PeArch.X64
+    assert ctx.analysis.previous_record is None
+    assert ctx.record.strategy is InstallStrategy.RENODX
+    assert ctx.record.files == []
+    assert not hasattr(ctx, "install_feeder")
+    assert not hasattr(ctx, "reshade_dll_name")
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()} == original_files
+
+
+@pytest.mark.parametrize("strategy", ["auto", "", "unknown"])
+def test_current_install_record_rejects_unresolved_strategy(tmp_path: Path, strategy: str) -> None:
+    with pytest.raises(ValidationError):
+        InstallRecord.model_validate(
+            {
+                "schema_version": CURRENT_RECORD_SCHEMA_VERSION,
+                "strategy": strategy,
+                "game_exe": (tmp_path / "game.exe").as_posix(),
+                "game_dir": tmp_path.as_posix(),
+            }
+        )
+
+
 def test_step_validate_target_opengl_x86(tmp_path: Path, mocker: MockerFixture) -> None:
     game_exe = tmp_path / "gl_game.exe"
     game_exe.write_bytes(b"MZ_DUMMY")
 
-    mocker.patch("dlss5_enabler.operations.steps.detect_pe_arch", return_value=PeArch.X86)
-    mocker.patch("dlss5_enabler.operations.steps.file_is_writable", return_value=True)
+    mocker.patch("dlss5_enabler.operations.steps_common.detect_pe_arch", return_value=PeArch.X86)
+    mocker.patch("dlss5_enabler.operations.steps_common.file_is_writable", return_value=True)
 
-    ctx = PipelineContext(game_exe=game_exe, opengl=True)
+    ctx = RenoDxContext(game_exe=game_exe, opengl=True)
     step = StepValidateTarget()
 
     assert step.execute(ctx)
+    assert StepConfigureRenoDx().execute(ctx)
     assert ctx.is_32bit
     assert ctx.reshade_api == "opengl"
     assert ctx.reshade_dll_name == "opengl32.dll"
@@ -577,7 +625,7 @@ def test_step_validate_target_opengl_x86(tmp_path: Path, mocker: MockerFixture) 
 
 def test_step_validate_target_missing_file(tmp_path: Path) -> None:
     game_exe = tmp_path / "missing.exe"
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
     step = StepValidateTarget()
 
     assert not step.execute(ctx)
@@ -588,8 +636,8 @@ def test_step_validate_target_unsupported_arch(tmp_path: Path, mocker: MockerFix
     game_exe = tmp_path / "arm64_game.exe"
     game_exe.write_bytes(b"MZ_DUMMY")
 
-    mocker.patch("dlss5_enabler.operations.steps.detect_pe_arch", return_value=PeArch.ARM64)
-    ctx = PipelineContext(game_exe=game_exe)
+    mocker.patch("dlss5_enabler.operations.steps_common.detect_pe_arch", return_value=PeArch.ARM64)
+    ctx = RenoDxContext(game_exe=game_exe)
     step = StepValidateTarget()
 
     assert not step.execute(ctx)
@@ -600,10 +648,10 @@ def test_step_validate_target_locked_executable(tmp_path: Path, mocker: MockerFi
     game_exe = tmp_path / "running_game.exe"
     game_exe.write_bytes(b"MZ_DUMMY")
 
-    mocker.patch("dlss5_enabler.operations.steps.detect_pe_arch", return_value=PeArch.X64)
-    mocker.patch("dlss5_enabler.operations.steps.file_is_writable", return_value=False)
+    mocker.patch("dlss5_enabler.operations.steps_common.detect_pe_arch", return_value=PeArch.X64)
+    mocker.patch("dlss5_enabler.operations.steps_common.file_is_writable", return_value=False)
 
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
     step = StepValidateTarget()
 
     assert not step.execute(ctx)
@@ -615,10 +663,10 @@ def test_step_validate_target_rejects_running_game(tmp_path: Path, mocker: Mocke
     game_exe.write_bytes(b"MZ_DUMMY")
     adapter = mocker.Mock()
     adapter.is_game_running.return_value = True
-    mocker.patch("dlss5_enabler.operations.steps.detect_pe_arch", return_value=PeArch.X64)
-    mocker.patch("dlss5_enabler.operations.steps.get_platform_adapter", return_value=adapter)
+    mocker.patch("dlss5_enabler.operations.steps_common.detect_pe_arch", return_value=PeArch.X64)
+    mocker.patch("dlss5_enabler.operations.steps_common.get_platform_adapter", return_value=adapter)
 
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
 
     assert not StepValidateTarget().execute(ctx)
     assert "currently running" in ctx.error_message
@@ -629,11 +677,11 @@ def test_step_validate_target_write_protected_directory(tmp_path: Path, mocker: 
     game_exe = tmp_path / "protected_game.exe"
     game_exe.write_bytes(b"MZ_DUMMY")
 
-    mocker.patch("dlss5_enabler.operations.steps.detect_pe_arch", return_value=PeArch.X64)
-    mocker.patch("dlss5_enabler.operations.steps.file_is_writable", return_value=True)
-    mocker.patch("dlss5_enabler.operations.steps.is_directory_writable", return_value=False)
+    mocker.patch("dlss5_enabler.operations.steps_common.detect_pe_arch", return_value=PeArch.X64)
+    mocker.patch("dlss5_enabler.operations.steps_common.file_is_writable", return_value=True)
+    mocker.patch("dlss5_enabler.operations.steps_common.is_directory_writable", return_value=False)
 
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
     step = StepValidateTarget()
 
     assert not step.execute(ctx)
@@ -646,15 +694,15 @@ def test_step_clean_previous_install(tmp_path: Path, mocker: MockerFixture) -> N
     game_exe = game_dir / "game.exe"
     game_exe.write_bytes(b"MZ_DUMMY")
 
-    mocker.patch("dlss5_enabler.operations.steps.record_exists", return_value=True)
+    mocker.patch("dlss5_enabler.operations.steps_common.record_exists", return_value=True)
     mocker.patch(
-        "dlss5_enabler.operations.steps.record_load",
+        "dlss5_enabler.operations.steps_common.record_load",
         return_value=InstallRecord(game_exe=str(game_exe), game_dir=str(game_dir)),
     )
-    mocker.patch("dlss5_enabler.operations.steps.capture_install_snapshot", return_value=mocker.MagicMock())
-    mocker.patch("dlss5_enabler.operations.steps.run_uninstall", return_value=True)
+    mocker.patch("dlss5_enabler.operations.steps_common.capture_install_snapshot", return_value=mocker.MagicMock())
+    mocker.patch("dlss5_enabler.operations.steps_common.run_uninstall", return_value=True)
 
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
     ctx.game_dir = game_dir
     step = StepCleanPreviousInstall()
 
@@ -667,15 +715,15 @@ def test_step_clean_previous_install_failure(tmp_path: Path, mocker: MockerFixtu
     game_exe = game_dir / "game.exe"
     game_exe.write_bytes(b"MZ_DUMMY")
 
-    mocker.patch("dlss5_enabler.operations.steps.record_exists", return_value=True)
+    mocker.patch("dlss5_enabler.operations.steps_common.record_exists", return_value=True)
     mocker.patch(
-        "dlss5_enabler.operations.steps.record_load",
+        "dlss5_enabler.operations.steps_common.record_load",
         return_value=InstallRecord(game_exe=str(game_exe), game_dir=str(game_dir)),
     )
-    mocker.patch("dlss5_enabler.operations.steps.capture_install_snapshot", return_value=mocker.MagicMock())
-    mocker.patch("dlss5_enabler.operations.steps.run_uninstall", return_value=False)
+    mocker.patch("dlss5_enabler.operations.steps_common.capture_install_snapshot", return_value=mocker.MagicMock())
+    mocker.patch("dlss5_enabler.operations.steps_common.run_uninstall", return_value=False)
 
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
     ctx.game_dir = game_dir
     step = StepCleanPreviousInstall()
 
@@ -699,12 +747,12 @@ def test_failed_refresh_restores_previous_installation(tmp_path: Path, mocker: M
     )
     previous.record_path().write_text(previous.model_dump_json(), encoding="utf-8")
     mocker.patch("dlss5_enabler.operations.uninstall.index_remove", return_value=True)
-    mocker.patch("dlss5_enabler.operations.uninstall.index_add", return_value=True)
-    ctx = PipelineContext(game_exe=game_exe)
+    mocker.patch("dlss5_enabler.operations.uninstall.restore_index_entry", return_value=True)
+    ctx = RenoDxContext(game_exe=game_exe)
     ctx.game_dir = game_dir
     ctx.record = InstallRecord(game_exe=str(game_exe), game_dir=str(game_dir))
 
-    assert not PipelineRunner([StepCleanPreviousInstall(), DummyFailureStep()]).run(ctx)
+    assert not PipelineRunner[RenoDxContext]([StepCleanPreviousInstall(), DummyFailureStep()]).run(ctx)
     assert installed.read_bytes() == b"OLD_DLSS5_ENABLER"
     assert backup.read_bytes() == b"GAME_ORIGINAL"
     assert previous.record_path().is_file()
@@ -718,7 +766,7 @@ def test_place_file_with_backup(tmp_path: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_bytes(b"ORIGINAL_VERSION")
 
-    ctx = PipelineContext(game_exe=tmp_path / "game" / "game.exe")
+    ctx = RenoDxContext(game_exe=tmp_path / "game" / "game.exe")
     _place_file(ctx, src, dst)
 
     assert dst.read_bytes() == b"NEW_VERSION"
@@ -737,7 +785,7 @@ def test_place_file_never_overwrites_unreconciled_backup(tmp_path: Path) -> None
     dst.write_bytes(b"ORIGINAL_VERSION")
     old_backup = dst.with_suffix(".dll.dlss5-enabler.bak")
     old_backup.write_bytes(b"OLDER_ORIGINAL")
-    ctx = PipelineContext(game_exe=tmp_path / "game.exe")
+    ctx = RenoDxContext(game_exe=tmp_path / "game.exe")
 
     _place_file(ctx, src, dst)
 
@@ -752,10 +800,10 @@ def test_pipeline_failure_rolls_back_recorded_file(tmp_path: Path) -> None:
     dst = tmp_path / "game" / "target.dll"
     dst.parent.mkdir()
     dst.write_bytes(b"ORIGINAL")
-    ctx = PipelineContext(game_exe=tmp_path / "game" / "game.exe")
+    ctx = RenoDxContext(game_exe=tmp_path / "game" / "game.exe")
     ctx.record = InstallRecord(game_exe=str(ctx.game_exe), game_dir=str(dst.parent))
 
-    class MutatingFailure(PipelineStep):
+    class MutatingFailure(PipelineStep[RenoDxContext]):
         @property
         def name(self) -> str:
             return "MutatingFailure"
@@ -764,7 +812,7 @@ def test_pipeline_failure_rolls_back_recorded_file(tmp_path: Path) -> None:
         def description(self) -> str:
             return "Mutates and fails"
 
-        def execute(self, ctx: PipelineContext) -> bool:
+        def execute(self, ctx: RenoDxContext) -> bool:
             _place_file(ctx, src, dst)
             return False
 
@@ -825,9 +873,10 @@ def test_validate_refuses_unknown_existing_proxy(tmp_path: Path) -> None:
     game_exe = tmp_path / "game.exe"
     game_exe.write_bytes(_synthetic_pe(IMAGE_FILE_MACHINE_AMD64))
     (tmp_path / "dxgi.dll").write_bytes(b"NOT_RESHADER")
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
 
-    assert not StepValidateTarget().execute(ctx)
+    assert StepValidateTarget().execute(ctx)
+    assert not StepConfigureRenoDx().execute(ctx)
     assert "refusing to assume it is ReShade" in ctx.error_message
 
 
@@ -901,6 +950,8 @@ def test_run_uninstall_removes_feeder_host_runtime_artifacts(tmp_path: Path, moc
         game_dir=str(game_dir),
         reshade_dir=str(game_dir),
         reshade_by_us=True,
+        runtime_artifacts=[RuntimeArtifacts(directory=host_dir.as_posix(), pattern="dlss5-feed-host*")],
+        created_directories=[host_dir.as_posix()],
     )
     rec.record_path().write_text(rec.model_dump_json(), encoding="utf-8")
     mocker.patch("dlss5_enabler.operations.uninstall.index_remove", return_value=True)
@@ -924,10 +975,12 @@ def test_failed_uninstall_restores_feeder_host_runtime_artifacts(tmp_path: Path,
         game_dir=str(game_dir),
         reshade_dir=str(game_dir),
         reshade_by_us=True,
+        runtime_artifacts=[RuntimeArtifacts(directory=host_dir.as_posix(), pattern="dlss5-feed-host*")],
+        created_directories=[host_dir.as_posix()],
     )
     rec.record_path().write_text(rec.model_dump_json(), encoding="utf-8")
     mocker.patch("dlss5_enabler.operations.uninstall.index_remove", return_value=False)
-    mocker.patch("dlss5_enabler.operations.uninstall.index_add", return_value=True)
+    mocker.patch("dlss5_enabler.operations.uninstall.restore_index_entry", return_value=True)
 
     assert not run_uninstall(game_dir)
     assert host_log.read_bytes() == b"HOST_LOG"
@@ -952,7 +1005,7 @@ def test_run_uninstall_failure_restores_installed_state(tmp_path: Path, mocker: 
         return False
 
     mocker.patch("dlss5_enabler.operations.uninstall.revert_record_mutations", side_effect=partial_failure)
-    mocker.patch("dlss5_enabler.operations.uninstall.index_add", return_value=True)
+    mocker.patch("dlss5_enabler.operations.uninstall.restore_index_entry", return_value=True)
 
     assert not run_uninstall(game_dir)
     assert placed.read_bytes() == b"MOD"
@@ -1029,7 +1082,7 @@ def test_step_configure_wine_overrides(tmp_path: Path, mocker: MockerFixture) ->
     prefix_info = SteamPrefixInfo(appid="123", prefix_path=pfx_dir, game_dir=tmp_path / "game")
     mocker.patch("dlss5_enabler.operations.steps.ProtonManager.find_prefix_for_game", return_value=prefix_info)
 
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
     ctx.reshade_dll_name = "dxgi.dll"
     ctx.record = InstallRecord(game_exe=str(game_exe), game_dir=str(tmp_path / "game"))
 
@@ -1056,7 +1109,7 @@ def test_step_configure_wine_overrides_records_existing_value(tmp_path: Path, mo
     )
     prefix = SteamPrefixInfo(appid="123", prefix_path=pfx_dir, game_dir=game_dir)
     mocker.patch("dlss5_enabler.operations.steps.ProtonManager.find_prefix_for_game", return_value=prefix)
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
     ctx.reshade_dll_name = "dxgi.dll"
     ctx.record = InstallRecord(game_exe=str(game_exe), game_dir=str(game_dir))
 
@@ -1071,16 +1124,16 @@ def test_step_configure_wine_overrides_records_existing_value(tmp_path: Path, mo
 
 
 def test_step_save_record_propagates_failure(tmp_path: Path, mocker: MockerFixture) -> None:
-    ctx = PipelineContext(game_exe=tmp_path / "game.exe")
+    ctx = RenoDxContext(game_exe=tmp_path / "game.exe")
     ctx.record = InstallRecord(game_exe=str(ctx.game_exe), game_dir=str(tmp_path))
-    mocker.patch("dlss5_enabler.operations.steps.record_save", return_value=False)
+    mocker.patch("dlss5_enabler.operations.steps_common.record_save", return_value=False)
 
     assert not StepSaveRecord().execute(ctx)
     assert "per-game install record" in ctx.error_message
 
 
 def test_vulkan_request_fails_when_archive_is_unavailable(tmp_path: Path) -> None:
-    ctx = PipelineContext(game_exe=tmp_path / "game.exe", install_vulkan_layer=True)
+    ctx = RenoDxContext(game_exe=tmp_path / "game.exe", install_vulkan_layer=True)
     ctx.record = InstallRecord(game_exe=str(ctx.game_exe), game_dir=str(tmp_path), vulkan_layer=True)
 
     assert not StepInstallVulkanLayer().execute(ctx)
@@ -1095,7 +1148,7 @@ def test_vulkan_install_backs_up_existing_file(tmp_path: Path) -> None:
     destination.write_bytes(b"ORIGINAL_LAYER")
     bundle = FeederBundle()
     bundle.vk_layer_zip = archive
-    ctx = PipelineContext(game_exe=tmp_path / "game.exe", install_vulkan_layer=True)
+    ctx = RenoDxContext(game_exe=tmp_path / "game.exe", install_vulkan_layer=True)
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.feeder_bundle = bundle
@@ -1123,7 +1176,7 @@ def test_vulkan_install_selects_game_architecture(
         zf.writestr("layer-x86/VkLayer_feed_vk32.dll", b"X86")
     bundle = FeederBundle()
     bundle.vk_layer_zip = archive
-    ctx = PipelineContext(game_exe=tmp_path / "game.exe", install_vulkan_layer=True)
+    ctx = RenoDxContext(game_exe=tmp_path / "game.exe", install_vulkan_layer=True)
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.is_32bit = is_32bit
@@ -1136,46 +1189,45 @@ def test_vulkan_install_selects_game_architecture(
     assert not (tmp_path / excluded).exists()
 
 
-def test_reshade_success_requires_installed_hook(tmp_path: Path, mocker: MockerFixture) -> None:
+def test_reshade_invalid_setup_preserves_game_files(tmp_path: Path, mocker: MockerFixture) -> None:
     setup = tmp_path / "setup.exe"
     setup.write_bytes(b"SETUP")
     game_exe = tmp_path / "game.exe"
     game_exe.write_bytes(b"MZ")
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.need_reshade = True
     ctx.record = InstallRecord(game_exe=str(game_exe), game_dir=str(tmp_path))
     ctx.reshade_bundle = ReshadeBundle()
     ctx.reshade_bundle.setup_exe_path = setup
-    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", return_value=True)
+    mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
 
-    assert not StepInstallReShade().execute(ctx)
-    assert "without creating" in ctx.error_message
+    original_entries = {path.name for path in tmp_path.iterdir()}
+    assert not PipelineRunner([StepInstallReShade()]).run(ctx)
+    assert "required runtime" in ctx.error_message
+    assert game_exe.read_bytes() == b"MZ"
+    assert setup.read_bytes() == b"SETUP"
+    assert {path.name for path in tmp_path.iterdir()} == original_entries
 
 
 def test_reshade_existing_ini_is_restored_on_uninstall(tmp_path: Path, mocker: MockerFixture) -> None:
     setup = tmp_path / "setup.exe"
-    setup.write_bytes(b"SETUP")
-    extracted_dll = tmp_path / "ReShade64.dll"
-    extracted_dll.write_bytes(b"RESHADER")
+    with zipfile.ZipFile(setup, "w") as archive:
+        archive.writestr("ReShade64.dll", b"RESHADER")
     game_exe = tmp_path / "game.exe"
     game_exe.write_bytes(b"MZ")
     game_ini = tmp_path / "ReShade.ini"
     original_ini = b"[GENERAL]\nUserSetting=Preserve\n"
     game_ini.write_bytes(original_ini)
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.need_reshade = True
     ctx.record = InstallRecord(game_exe=str(game_exe), game_dir=str(tmp_path))
     ctx.reshade_bundle = ReshadeBundle()
     ctx.reshade_bundle.setup_exe_path = setup
-    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", return_value=False)
-    mocker.patch(
-        "dlss5_enabler.operations.steps.extract_reshade_dlls_from_installer",
-        return_value={"reshade64.dll": extracted_dll},
-    )
+    mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
 
     assert StepInstallReShade().execute(ctx)
     assert any(item.path == game_ini.as_posix() and item.backup for item in ctx.record.files)
@@ -1187,25 +1239,18 @@ def test_reshade_existing_ini_is_restored_on_uninstall(tmp_path: Path, mocker: M
 
 def test_reshade_records_and_removes_runtime_artifacts(tmp_path: Path, mocker: MockerFixture) -> None:
     setup = tmp_path / "setup.exe"
-    setup.write_bytes(b"SETUP")
+    with zipfile.ZipFile(setup, "w") as archive:
+        archive.writestr("ReShade64.dll", b"RESHADE")
     game_exe = tmp_path / "game.exe"
     game_exe.write_bytes(b"MZ")
-    ctx = PipelineContext(game_exe=game_exe)
+    ctx = RenoDxContext(game_exe=game_exe)
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.need_reshade = True
     ctx.record = InstallRecord(game_exe=str(game_exe), game_dir=str(tmp_path))
     ctx.reshade_bundle = ReshadeBundle()
     ctx.reshade_bundle.setup_exe_path = setup
-
-    def install_reshade(_setup: Path, _target: Path, _api: str) -> bool:
-        (tmp_path / "dxgi.dll").write_bytes(b"RESHADE")
-        (tmp_path / "ReShade.ini").write_text("[GENERAL]\n", encoding="utf-8")
-        (tmp_path / "ReShade.log").write_text("ReShade", encoding="utf-8")
-        (tmp_path / "ReShadePreset.ini").write_text("Preset", encoding="utf-8")
-        return True
-
-    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", side_effect=install_reshade)
+    mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
 
     assert StepInstallReShade().execute(ctx)
     artifact_names = {
@@ -1228,42 +1273,47 @@ def test_reshade_records_and_removes_runtime_artifacts(tmp_path: Path, mocker: M
     assert not any((tmp_path / name).exists() for name in artifact_names)
 
 
-def test_reshade_redirected_d3d9_install_relocates_then_mirrors(tmp_path: Path, mocker: MockerFixture) -> None:
+def test_reshade_d3d9_mirror_restores_existing_bin_files(tmp_path: Path, mocker: MockerFixture) -> None:
     setup = tmp_path / "setup.exe"
-    setup.write_bytes(b"SETUP")
+    with zipfile.ZipFile(setup, "w") as archive:
+        archive.writestr("ReShade64.dll", b"RESHADE")
     game_exe = tmp_path / "game.exe"
     game_exe.write_bytes(b"MZ")
-    redirected_dir = tmp_path / "bin"
-    ctx = PipelineContext(game_exe=game_exe, d3d9_translate=True)
+    alternate_dir = tmp_path / "bin"
+    alternate_dir.mkdir()
+    original_proxy = b"user-owned bin proxy"
+    original_bin_ini = b"[GENERAL]\r\nEffectSearchPaths = CustomShaders\r\n"
+    original_root_ini = b"[INSTALL]\r\nBasePath = bin\r\n"
+    (alternate_dir / "dxgi.dll").write_bytes(original_proxy)
+    (alternate_dir / "ReShade.ini").write_bytes(original_bin_ini)
+    (tmp_path / "ReShade.ini").write_bytes(original_root_ini)
+    ctx = RenoDxContext(game_exe=game_exe, d3d9_translate=True)
     ctx.game_dir = tmp_path
     ctx.reshade_dir = tmp_path
     ctx.need_reshade = True
     ctx.record = InstallRecord(game_exe=str(game_exe), game_dir=str(tmp_path))
     ctx.reshade_bundle = ReshadeBundle()
     ctx.reshade_bundle.setup_exe_path = setup
-
-    def install_reshade(_setup: Path, _target: Path, _api: str) -> bool:
-        redirected_dir.mkdir()
-        (tmp_path / "ReShade.ini").write_text("[INSTALL]\nBasePath=bin\n", encoding="utf-8")
-        (redirected_dir / "dxgi.dll").write_bytes(b"RESHADE")
-        (redirected_dir / "ReShade.ini").write_text(
-            "[GENERAL]\nEffectSearchPaths=.\\reshade-shaders\\Shaders\\**\\**\n",
-            encoding="utf-8",
-        )
-        return True
-
-    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", side_effect=install_reshade)
+    mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
 
     assert StepInstallReShade().execute(ctx)
     assert ctx.reshade_dir == tmp_path
     assert (tmp_path / "dxgi.dll").read_bytes() == b"RESHADE"
-    assert not (redirected_dir / "dxgi.dll").exists()
+    assert (alternate_dir / "dxgi.dll").read_bytes() == original_proxy
+    assert (alternate_dir / "ReShade.ini").read_bytes() == original_bin_ini
     assert StepMirrorDualLocations().execute(ctx)
-    assert (redirected_dir / "dxgi.dll").read_bytes() == b"RESHADE"
-    assert "EffectSearchPaths=.\\reshade-shaders\\Shaders\\**" in (redirected_dir / "ReShade.ini").read_text(
+    assert (alternate_dir / "dxgi.dll").read_bytes() == b"RESHADE"
+    assert "EffectSearchPaths=.\\reshade-shaders\\Shaders\\**" in (alternate_dir / "ReShade.ini").read_text(
         encoding="utf-8"
     )
-    assert not (redirected_dir / "bin").exists()
+    assert not (alternate_dir / "bin").exists()
+    assert record_save(ctx.record)
+    assert run_uninstall(tmp_path)
+    assert (alternate_dir / "dxgi.dll").read_bytes() == original_proxy
+    assert (alternate_dir / "ReShade.ini").read_bytes() == original_bin_ini
+    assert (tmp_path / "ReShade.ini").read_bytes() == original_root_ini
+    assert not (tmp_path / "dxgi.dll").exists()
+    assert not tuple(tmp_path.rglob("*.dlss5-enabler.bak*"))
 
 
 def test_mirror_dual_locations_backs_up_existing_file(tmp_path: Path) -> None:
@@ -1274,7 +1324,7 @@ def test_mirror_dual_locations_backs_up_existing_file(tmp_path: Path) -> None:
     source.write_bytes(b"NEW")
     destination = alt_bin / "addon.dll"
     destination.write_bytes(b"ORIGINAL")
-    ctx = PipelineContext(game_exe=game_dir / "game.exe", d3d9_translate=True)
+    ctx = RenoDxContext(game_exe=game_dir / "game.exe", d3d9_translate=True)
     ctx.game_dir = game_dir
     ctx.reshade_dir = game_dir
     ctx.record = InstallRecord(
@@ -1365,13 +1415,7 @@ def test_synthetic_install_and_uninstall_round_trip(
         for name, bundle in bundles.items()
     }
 
-    def install_reshade(_setup_exe: Path, target_exe: Path, _api: str) -> bool:
-        target_exe.parent.mkdir(parents=True, exist_ok=True)
-        (target_exe.parent / "dxgi.dll").write_bytes(b"synthetic-reshade")
-        (target_exe.parent / "ReShade.ini").write_text("[GENERAL]\n", encoding="utf-8")
-        return True
-
-    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", side_effect=install_reshade)
+    mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
     mocker.patch("dlss5_enabler.operations.steps.ProtonManager.find_prefix_for_game", return_value=None)
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
@@ -1429,12 +1473,7 @@ def test_synthetic_game_update_round_trip(
         for name, bundle in bundles.items()
     }
 
-    def install_reshade(_setup_exe: Path, target_exe: Path, _api: str) -> bool:
-        (target_exe.parent / "dxgi.dll").write_bytes(b"synthetic-reshade")
-        (target_exe.parent / "ReShade.ini").write_text("[GENERAL]\n", encoding="utf-8")
-        return True
-
-    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", side_effect=install_reshade)
+    mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
     mocker.patch("dlss5_enabler.operations.steps.ProtonManager.find_prefix_for_game", return_value=None)
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
@@ -1448,7 +1487,7 @@ def test_synthetic_game_update_round_trip(
     previous.install_options = InstallOptions(lumenite=False)
     assert record_save(previous)
     mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.1.0")
-    mocker.patch("dlss5_enabler.operations.steps.get_tool_version", return_value="1.1.0")
+    mocker.patch("dlss5_enabler.operations.steps_common.get_tool_version", return_value="1.1.0")
 
     result = run_update(game_dir)
 
@@ -1456,7 +1495,7 @@ def test_synthetic_game_update_round_trip(
     updated = record_load(game_dir)
     assert updated is not None
     assert updated.tool_version == "1.1.0"
-    assert updated.schema_version == 2
+    assert updated.schema_version == CURRENT_RECORD_SCHEMA_VERSION
     assert updated.install_options == InstallOptions(lumenite=False)
     assert all(fetch.call_count == 2 for fetch in fetches.values())
     assert not tuple(game_dir.rglob("*.dlss5-enabler.bak*"))
@@ -1480,15 +1519,10 @@ def test_update_fetch_failure_preserves_existing_installation(
     for name, bundle in bundles.items():
         mocker.patch(f"dlss5_enabler.operations.steps.{name}", return_value=bundle)
 
-    def install_reshade(_setup_exe: Path, target_exe: Path, _api: str) -> bool:
-        (target_exe.parent / "dxgi.dll").write_bytes(b"synthetic-reshade")
-        (target_exe.parent / "ReShade.ini").write_text("[GENERAL]\n", encoding="utf-8")
-        return True
-
-    mocker.patch("dlss5_enabler.operations.steps.reshade_headless_install", side_effect=install_reshade)
+    mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
     mocker.patch("dlss5_enabler.operations.steps.ProtonManager.find_prefix_for_game", return_value=None)
     mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.1.0")
-    mocker.patch("dlss5_enabler.operations.steps.get_tool_version", return_value="1.1.0")
+    mocker.patch("dlss5_enabler.operations.steps_common.get_tool_version", return_value="1.1.0")
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
@@ -1509,3 +1543,65 @@ def test_update_fetch_failure_preserves_existing_installation(
     after = {path.relative_to(game_dir).as_posix(): path.read_bytes() for path in game_dir.rglob("*") if path.is_file()}
     assert result.status is GameUpdateStatus.FAILED
     assert after == before
+
+
+@pytest.mark.parametrize(
+    ("machine", "available_runtime"),
+    [
+        (IMAGE_FILE_MACHINE_AMD64, None),
+        (IMAGE_FILE_MACHINE_AMD64, "ReShade32.dll"),
+        (IMAGE_FILE_MACHINE_I386, "ReShade32.dll"),
+        (IMAGE_FILE_MACHINE_I386, "ReShade64.dll"),
+    ],
+)
+def test_invalid_prepared_reshade_preserves_previous_install_before_uninstall(
+    tmp_path: Path, mocker: MockerFixture, machine: int, available_runtime: str | None
+) -> None:
+    game_dir = tmp_path / "game"
+    game_dir.mkdir()
+    game_exe = game_dir / "game.exe"
+    game_exe.write_bytes(_synthetic_pe(machine))
+    existing_proxy = game_dir / "dxgi.dll"
+    existing_proxy.write_bytes(b"previous managed ReShade")
+    existing_ini = game_dir / "ReShade.ini"
+    existing_ini.write_bytes(b"[GENERAL]\r\nCustomSetting = preserve bytes\r\n")
+    previous = InstallRecord(
+        game_exe=game_exe.as_posix(),
+        game_dir=game_dir.as_posix(),
+        tool_version="1.1.3",
+        architecture="x86" if machine == IMAGE_FILE_MACHINE_I386 else "x64",
+        is_32bit=machine == IMAGE_FILE_MACHINE_I386,
+        reshade_by_us=True,
+        files=[RecordedFile(path=existing_proxy.as_posix()), RecordedFile(path=existing_ini.as_posix())],
+    )
+    assert record_save(previous)
+    assert index_add(previous)
+    original_index = index_load()
+    original_files = {path.name: path.read_bytes() for path in game_dir.iterdir() if path.is_file()}
+    bundles = _synthetic_bundles(tmp_path / "artifacts")
+    reshade = bundles["fetch_reshade"]
+    assert isinstance(reshade, ReshadeBundle)
+    setup = reshade.setup_exe_path
+    assert setup is not None
+    if available_runtime is None:
+        setup.write_bytes(b"invalid installer without an archive")
+    else:
+        with zipfile.ZipFile(setup, "w") as archive:
+            archive.writestr(available_runtime, b"wrong or incomplete architecture set")
+    for name, bundle in bundles.items():
+        mocker.patch(f"dlss5_enabler.operations.steps.{name}", return_value=bundle)
+    mocker.patch("dlss5_enabler.operations.steps.get_cache_dir", return_value=tmp_path)
+    uninstall_previous = mocker.patch("dlss5_enabler.operations.steps_common.run_uninstall")
+    ctx = RenoDxContext(game_exe=game_exe, install_lumenite=False)
+
+    result = build_install_pipeline().run_result(ctx)
+
+    assert result.status is PipelineStatus.FAILED
+    assert result.failed_step == "PrepareRenoDx"
+    assert not result.success
+    uninstall_previous.assert_not_called()
+    assert {path.name: path.read_bytes() for path in game_dir.iterdir() if path.is_file()} == original_files
+    assert index_load() == original_index
+    assert ctx.previous_install_snapshot is None
+    assert ctx.staging_directory is None
+    assert not tuple(tmp_path.glob("dlss5-enabler-reshade-*"))

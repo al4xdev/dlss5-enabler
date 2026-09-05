@@ -1,34 +1,30 @@
+import shutil
 import tempfile
 from pathlib import Path
 
 from rich.console import Console
-from rich.panel import Panel
 
-from dlss5_enabler.core.fileio import atomic_copy_file, resource_lock, unique_backup_path
+from dlss5_enabler.core.fileio import _atomic_copy_file_unlocked
 from dlss5_enabler.core.ini import ini_get_exact, ini_set_exact
 from dlss5_enabler.core.logger import get_logger
-from dlss5_enabler.core.pe import PeArch, check_api_mismatches, detect_game_apis, detect_native_dlss, detect_pe_arch
+from dlss5_enabler.core.mutations import (
+    managed_file_lock,
+    prepare_managed_path,
+    prepare_runtime_artifacts,
+    track_created_directories,
+)
+from dlss5_enabler.core.pe import PeArch, check_api_mismatches
 from dlss5_enabler.core.record import (
     IniTouch,
     InstallOptions,
-    InstallRecord,
     RecordedFile,
     RegistryTouch,
-    index_add,
-    record_exists,
-    record_load,
-    record_save,
 )
 from dlss5_enabler.core.util import (
-    file_is_writable,
     get_cache_dir,
-    get_permission_guidance,
-    is_directory_writable,
-    remove_dir_if_empty,
     sha256_file,
     unblock_file,
 )
-from dlss5_enabler.core.version import get_tool_version
 from dlss5_enabler.network.sources import (
     fetch_dgvoodoo,
     fetch_feeder,
@@ -40,18 +36,12 @@ from dlss5_enabler.network.sources import (
     zip_extract_matching,
     zip_has_matching,
 )
-from dlss5_enabler.operations.pipeline import PipelineContext, PipelineStep
+from dlss5_enabler.operations.contexts import RenoDxContext
+from dlss5_enabler.operations.pipeline import PipelineStep
 from dlss5_enabler.operations.reshade import (
     ensure_mv_provider_def,
     extract_reshade_dlls_from_installer,
     normalize_search_paths,
-    reshade_headless_install,
-)
-from dlss5_enabler.operations.uninstall import (
-    capture_install_snapshot,
-    cleanup_install_snapshot,
-    restore_install_snapshot,
-    run_uninstall,
 )
 from dlss5_enabler.platform import ProtonManager, get_platform_adapter
 
@@ -67,32 +57,20 @@ _RESHADER_RUNTIME_ARTIFACTS = (
 )
 
 
-def _prepare_managed_path(ctx: PipelineContext, dst: Path) -> RecordedFile:
-    with resource_lock(dst):
-        existing = next((item for item in ctx.record.files if Path(item.path).resolve() == dst.resolve()), None)
-        if existing is not None:
-            return existing
-        backup_str = ""
-        if dst.exists():
-            backup = unique_backup_path(dst)
-            atomic_copy_file(dst, backup)
-            backup_str = str(backup)
-            logger.info(f"Backed up existing file: {dst.name} -> {backup.name}")
-        item = RecordedFile(path=str(dst), backup=backup_str)
-        ctx.record.files.append(item)
-        return item
+def _prepare_managed_path(ctx: RenoDxContext, dst: Path) -> RecordedFile:
+    return prepare_managed_path(ctx.record, dst)
 
 
-def _place_file(ctx: PipelineContext, src: Path, dst: Path) -> None:
-    item = _prepare_managed_path(ctx, dst)
-    atomic_copy_file(src, dst)
-    unblock_file(dst)
-    item.size_bytes = dst.stat().st_size
-    item.sha256 = sha256_file(dst)
+def _place_file(ctx: RenoDxContext, src: Path, dst: Path) -> None:
+    with managed_file_lock(ctx.record, dst) as item:
+        _atomic_copy_file_unlocked(src, dst)
+        unblock_file(dst)
+        item.size_bytes = dst.stat().st_size
+        item.sha256 = sha256_file(dst)
     logger.debug(f"Placed file: {dst}")
 
 
-def _prepare_reshade_runtime_artifacts(ctx: PipelineContext) -> None:
+def _prepare_reshade_runtime_artifacts(ctx: RenoDxContext) -> None:
     directories = [ctx.reshade_dir]
     if ctx.is_32bit:
         directories.append(ctx.reshade_dir / "host64")
@@ -102,100 +80,62 @@ def _prepare_reshade_runtime_artifacts(ctx: PipelineContext) -> None:
 
 
 def _install_reshade_from_extraction(
-    ctx: PipelineContext,
+    ctx: RenoDxContext,
     setup_exe: Path,
     target_dll: Path,
     ini_path: Path,
     bitness_key: str,
 ) -> bool:
-    logger.info("ReShade unattended setup failed; attempting in-process extraction fallback...")
-    with tempfile.TemporaryDirectory(prefix="dlss5-enabler-reshade-", dir=get_cache_dir()) as stage_name:
-        dlls = extract_reshade_dlls_from_installer(setup_exe, Path(stage_name))
-        source_dll = dlls.get(bitness_key)
+    logger.info("Placing the architecture-specific ReShade runtime from isolated extraction.")
+    if ctx.prepared_reshade:
+        source_dll = ctx.prepared_reshade.get(bitness_key)
         if source_dll is None:
             return False
         _place_file(ctx, source_dll, target_dll)
+    else:
+        with tempfile.TemporaryDirectory(prefix="dlss5-enabler-reshade-", dir=get_cache_dir()) as stage_name:
+            dlls = extract_reshade_dlls_from_installer(setup_exe, Path(stage_name))
+            source_dll = dlls.get(bitness_key)
+            if source_dll is None:
+                return False
+            _place_file(ctx, source_dll, target_dll)
     if ini_path.is_file():
         return True
+    _prepare_managed_path(ctx, ini_path)
     effect_ok = ini_set_exact(ini_path, "GENERAL", "EffectSearchPaths", "./reshade-shaders/Shaders/**")
     texture_ok = ini_set_exact(ini_path, "GENERAL", "TextureSearchPaths", "./reshade-shaders/Textures/**")
     return effect_ok and texture_ok
 
 
-def _relocate_redirected_d3d9_reshade(ctx: PipelineContext, game_ini: Path) -> bool:
-    if not ctx.d3d9_translate or ctx.reshade_dir == ctx.game_dir:
-        return True
-    redirected_dir = ctx.reshade_dir
-    redirected_dll = redirected_dir / ctx.reshade_dll_name
-    redirected_ini = redirected_dir / "ReShade.ini"
-    if not redirected_dll.is_file():
-        ctx.error_message = f"ReShade redirect did not create {ctx.reshade_dll_name}."
-        return False
-    _place_file(ctx, redirected_dll, ctx.game_dir / ctx.reshade_dll_name)
-    if redirected_ini.is_file():
-        _place_file(ctx, redirected_ini, game_ini)
-    try:
-        redirected_dll.unlink()
-        redirected_ini.unlink(missing_ok=True)
-        (redirected_dir / "ReShadePreset.ini").unlink(missing_ok=True)
-    except OSError as error:
-        ctx.error_message = f"Could not relocate ReShade output from {redirected_dir.name}: {error}"
-        return False
-    ctx.reshade_dir = ctx.game_dir
-    logger.info("Moved redirected ReShade output into the game directory for D3D9 mirroring.")
-    return True
-
-
-class StepValidateTarget(PipelineStep):
+class StepConfigureRenoDx(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
-        return "ValidateTarget"
+        return "ConfigureRenoDx"
 
     @property
     def description(self) -> str:
-        return "Validates game executable architecture, permissions, and environment"
+        return "Selects the RenoDX components and hook from the target analysis"
 
-    def execute(self, ctx: PipelineContext) -> bool:
-        ctx.game_exe = ctx.game_exe.resolve()
-        if (ctx.d3d9_translate and ctx.opengl) or not ctx.game_exe.is_file():
-            ctx.error_message = (
-                "D3D9 translation and OpenGL mode cannot be enabled together."
-                if ctx.d3d9_translate and ctx.opengl
-                else f"Game executable not found: {ctx.game_exe}"
-            )
+    def execute(self, ctx: RenoDxContext) -> bool:
+        analysis = ctx.analysis
+        if analysis is None:
+            ctx.error_message = "Target analysis is required before selecting the RenoDX installation."
             return False
-
-        ctx.game_dir = ctx.game_exe.parent
+        if ctx.d3d9_translate and ctx.opengl:
+            ctx.error_message = "D3D9 translation and OpenGL mode cannot be enabled together."
+            return False
         ctx.reshade_dir = ctx.game_dir
-        ctx.pe_arch = detect_pe_arch(ctx.game_exe)
+        ctx.pe_arch = analysis.architecture
         ctx.is_32bit = ctx.pe_arch == PeArch.X86
         ctx.reshade_api = "opengl" if ctx.opengl else "dxgi"
         ctx.reshade_dll_name = "opengl32.dll" if ctx.opengl else "dxgi.dll"
-
-        previous = record_load(ctx.game_dir) if record_exists(ctx.game_dir) else None
-        previous_native_dlss = bool(
-            previous
-            and any(Path(item.path).name.lower() == "nvngx_dlss.dll" and bool(item.backup) for item in previous.files)
-        )
-        managed_dlss_only = bool(
-            previous
-            and any(Path(item.path).name.lower() == "nvngx_dlss.dll" and not item.backup for item in previous.files)
-        )
-        ctx.native_dlss_detected = previous_native_dlss or (not managed_dlss_only and detect_native_dlss(ctx.game_exe))
+        ctx.native_dlss_detected = analysis.native_dlss
         ctx.install_feeder = not ctx.native_dlss_detected
-        if ctx.pe_arch in (PeArch.UNKNOWN, PeArch.ARM64) or (ctx.native_dlss_detected and ctx.is_32bit):
-            ctx.error_message = (
-                "Native DLSS was detected, but direct RenoDX installation requires a 64-bit game."
-                if ctx.native_dlss_detected and ctx.is_32bit
-                else f"Unsupported architecture ({ctx.pe_arch.value}). Supported: x86 (32-bit), x64 (64-bit)."
-            )
+        if ctx.native_dlss_detected and ctx.is_32bit:
+            ctx.error_message = "Native DLSS was detected, but direct RenoDX installation requires a 64-bit game."
             return False
         if ctx.native_dlss_detected:
             logger.info("Native DLSS detected; installing RenoDX directly without DLSS5-Feeder.")
-            console.print(
-                "[bold cyan]Native DLSS detected.[/bold cyan] Skipping DLSS5-Feeder to avoid a duplicate DLSS evaluate."
-            )
-
         existing_proxy = ctx.game_dir / ctx.reshade_dll_name
         if existing_proxy.is_file() and not (ctx.game_dir / "ReShade.ini").is_file():
             ctx.error_message = (
@@ -203,115 +143,38 @@ class StepValidateTarget(PipelineStep):
                 "Remove or rename it before installing."
             )
             return False
-
-        game_is_running = get_platform_adapter().is_game_running(ctx.game_exe)
-        if game_is_running or not file_is_writable(ctx.game_exe):
-            ctx.error_message = (
-                f"Game is currently running: {ctx.game_exe.name}. Close it before installing."
-                if game_is_running
-                else f"Game executable is locked (game is currently running): {ctx.game_exe.name}"
-            )
-            return False
-
-        if not is_directory_writable(ctx.game_dir):
-            guidance = get_permission_guidance(ctx.game_dir)
-            console.print(
-                Panel(
-                    f"[bold red]Permission Denied[/bold red]\n"
-                    f"DLSS5 Enabler cannot write files to the game directory:\n"
-                    f"  [yellow]{ctx.game_dir}[/yellow]\n\n"
-                    f"{guidance}",
-                    title="Write-Protected Directory",
-                    border_style="red",
-                )
-            )
-            ctx.error_message = (
-                f"Game directory '{ctx.game_dir.name}' is write-protected. Apply suggested permissions and re-run."
-            )
-            return False
-
-        detected_apis = detect_game_apis(ctx.game_exe)
-        if detected_apis:
-            logger.info(f"Detected Graphics APIs: {', '.join(a.value for a in detected_apis)}")
-
-        warnings = check_api_mismatches(
+        previous = analysis.previous_record
+        ctx.need_reshade = not existing_proxy.is_file() or (previous is not None and previous.reshade_by_us)
+        for warning in check_api_mismatches(
             ctx.game_exe,
             d3d9=ctx.d3d9_translate,
             opengl=ctx.opengl,
             vulkan_layer=ctx.install_vulkan_layer,
-        )
-        for w in warnings:
-            logger.warning(f"API Heuristic Warning: {w}")
-            console.print(f"[bold yellow][WARNING] {w}[/bold yellow]")
-
+        ):
+            logger.warning(warning)
+            console.print(f"[bold yellow][WARNING] {warning}[/]")
         install_type = "D3D9 (dgVoodoo2)" if ctx.d3d9_translate else ("OpenGL" if ctx.opengl else "D3D11/D3D12")
         if ctx.install_vulkan_layer:
             install_type += " + Vulkan Layer"
-
-        ctx.record = InstallRecord(
-            tool_version=get_tool_version(),
-            game_exe=str(ctx.game_exe),
-            game_dir=str(ctx.game_dir),
-            architecture="x86" if ctx.is_32bit else "x64",
-            is_32bit=ctx.is_32bit,
-            install_type=install_type,
-            d3d9_translate=ctx.d3d9_translate,
+        ctx.record.install_type = install_type
+        ctx.record.d3d9_translate = ctx.d3d9_translate
+        ctx.record.opengl = ctx.opengl
+        ctx.record.vulkan_layer = ctx.install_vulkan_layer
+        ctx.record.lumenite_installed = ctx.install_lumenite
+        ctx.record.native_dlss_detected = ctx.native_dlss_detected
+        ctx.record.install_options = InstallOptions(
+            lumenite=ctx.install_lumenite,
+            d3d9=ctx.d3d9_translate,
             opengl=ctx.opengl,
             vulkan_layer=ctx.install_vulkan_layer,
-            lumenite_installed=ctx.install_lumenite,
-            native_dlss_detected=ctx.native_dlss_detected,
-            install_options=InstallOptions(
-                lumenite=ctx.install_lumenite,
-                d3d9=ctx.d3d9_translate,
-                opengl=ctx.opengl,
-                vulkan_layer=ctx.install_vulkan_layer,
-            ),
-            platform=get_platform_adapter().platform_name,
         )
-
         logger.info(
-            f"Target validated: {ctx.game_exe.name} [{ctx.pe_arch.value}] in {ctx.game_dir}; "
-            f"native_dlss={ctx.native_dlss_detected}"
+            f"Selected engine: {ctx.strategy.value}; native_dlss={analysis.native_dlss}; proxy={ctx.reshade_dll_name}"
         )
         return True
 
 
-class StepCleanPreviousInstall(PipelineStep):
-    @property
-    def name(self) -> str:
-        return "CleanPreviousInstall"
-
-    @property
-    def description(self) -> str:
-        return "Checks and cleanly uninstalls prior DLSS5 Enabler installation if refreshing"
-
-    def execute(self, ctx: PipelineContext) -> bool:
-        if record_exists(ctx.game_dir):
-            logger.info("Existing installation record found. Performing clean pre-uninstall...")
-            previous = record_load(ctx.game_dir)
-            if previous is None:
-                ctx.error_message = "Existing installation record is unreadable; refusing to overwrite it."
-                return False
-            ctx.previous_install_snapshot = capture_install_snapshot(previous)
-            un_ok = run_uninstall(ctx.game_dir, log=logger.info, lock_operation=False)
-            if not un_ok:
-                ctx.error_message = "Failed to cleanly remove previous installation prior to refresh."
-                return False
-        return True
-
-    def rollback(self, ctx: PipelineContext) -> None:
-        if ctx.previous_install_snapshot is not None:
-            if not restore_install_snapshot(ctx.previous_install_snapshot):
-                raise RuntimeError("Could not restore the previous DLSS5 Enabler installation snapshot")
-            ctx.previous_install_snapshot = None
-
-    def commit(self, ctx: PipelineContext) -> None:
-        if ctx.previous_install_snapshot is not None:
-            cleanup_install_snapshot(ctx.previous_install_snapshot)
-            ctx.previous_install_snapshot = None
-
-
-class StepFetchUpstream(PipelineStep):
+class StepFetchUpstream(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
         return "FetchUpstream"
@@ -320,11 +183,7 @@ class StepFetchUpstream(PipelineStep):
     def description(self) -> str:
         return "Fetches/validates required upstream components from GitHub & ReShade"
 
-    def execute(self, ctx: PipelineContext) -> bool:
-        dxgi = ctx.game_dir / ctx.reshade_dll_name
-        previous = record_load(ctx.game_dir) if record_exists(ctx.game_dir) else None
-        ctx.need_reshade = not dxgi.is_file() or (previous is not None and previous.reshade_by_us)
-
+    def execute(self, ctx: RenoDxContext) -> bool:
         if ctx.need_reshade or ctx.is_32bit:
             logger.info("Fetching ReShade Addon installer...")
             ctx.reshade_bundle = fetch_reshade(logger.info, force=ctx.force_download)
@@ -371,85 +230,107 @@ class StepFetchUpstream(PipelineStep):
         return True
 
 
-class StepInstallReShade(PipelineStep):
+class StepPrepareRenoDx(PipelineStep[RenoDxContext]):
+    @property
+    def name(self) -> str:
+        return "PrepareRenoDx"
+
+    @property
+    def description(self) -> str:
+        return "Validates the selected files and stages ReShade before changing the game"
+
+    def execute(self, ctx: RenoDxContext) -> bool:
+        required: list[Path | None] = []
+        if not ctx.renodx_bundle or not ctx.ngx_bundle:
+            raise ValueError("RenoDX and NGX bundles are required.")
+        required.extend((ctx.renodx_bundle.addon64_path, ctx.ngx_bundle.nr_dll_path))
+        if ctx.install_feeder:
+            if not ctx.feeder_bundle:
+                raise ValueError("Feeder bundle is required.")
+            required.extend(
+                (
+                    ctx.feeder_bundle.addon32 if ctx.is_32bit else ctx.feeder_bundle.addon64,
+                    ctx.feeder_bundle.fx_shader,
+                    ctx.ngx_bundle.sr_dll_path,
+                )
+            )
+            if ctx.is_32bit:
+                required.append(ctx.feeder_bundle.host64_exe)
+            if ctx.install_vulkan_layer:
+                required.append(ctx.feeder_bundle.vk_layer_zip)
+        if ctx.install_feeder or ctx.install_lumenite:
+            if not ctx.headers_bundle:
+                raise ValueError("ReShade shader headers are required.")
+            required.extend(
+                (ctx.headers_bundle.fxh_path, ctx.headers_bundle.ui_fxh_path, ctx.headers_bundle.drawtext_path)
+            )
+        if ctx.d3d9_translate:
+            if not ctx.dgvoodoo_bundle:
+                raise ValueError("dgVoodoo2 bundle is required.")
+            required.extend((ctx.dgvoodoo_bundle.d3d9_dll, ctx.dgvoodoo_bundle.conf, ctx.dgvoodoo_bundle.cpl))
+        if ctx.install_lumenite:
+            if not ctx.lumenite_bundle or not ctx.lumenite_bundle.files:
+                raise ValueError("LumeniteFX shader bundle is required.")
+            required.extend(ctx.lumenite_bundle.files)
+        for path in required:
+            if path is None or not path.is_file() or path.stat().st_size == 0:
+                raise ValueError(f"Required RenoDX installation file is missing or empty: {path}")
+        if ctx.need_reshade or ctx.is_32bit:
+            if not ctx.reshade_bundle or not ctx.reshade_bundle.setup_exe_path:
+                raise ValueError("ReShade Addon bundle is required.")
+            ctx.staging_directory = Path(tempfile.mkdtemp(prefix="dlss5-enabler-reshade-", dir=get_cache_dir()))
+            ctx.prepared_reshade = extract_reshade_dlls_from_installer(
+                ctx.reshade_bundle.setup_exe_path, ctx.staging_directory
+            )
+            expected = ("reshade32.dll", "reshade64.dll") if ctx.is_32bit else ("reshade64.dll",)
+            if any(name not in ctx.prepared_reshade for name in expected):
+                raise ValueError("ReShade archive is missing the required architecture runtimes.")
+        return True
+
+    def rollback(self, ctx: RenoDxContext) -> None:
+        self.cleanup(ctx)
+
+    def cleanup(self, ctx: RenoDxContext) -> None:
+        if ctx.staging_directory is not None:
+            stage = ctx.staging_directory.resolve()
+            if stage.parent != get_cache_dir().resolve() or not stage.name.startswith("dlss5-enabler-reshade-"):
+                raise ValueError(f"Invalid staging directory: {stage}")
+            shutil.rmtree(stage)
+            ctx.staging_directory = None
+            ctx.prepared_reshade.clear()
+
+
+class StepInstallReShade(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
         return "InstallReShade"
 
     @property
     def description(self) -> str:
-        return "Installs ReShade with Addon support via headless setup and normalizes paths"
+        return "Places the staged ReShade runtime and configures its managed INI"
 
-    def execute(self, ctx: PipelineContext) -> bool:
-        game_ini = ctx.game_dir / "ReShade.ini"
-
-        if ctx.need_reshade and ctx.reshade_bundle and ctx.reshade_bundle.setup_exe_path:
-            primary_dll = ctx.game_dir / ctx.reshade_dll_name
-            _prepare_managed_path(ctx, primary_dll)
-            if game_ini.is_file():
-                had_base, original_base = ini_get_exact(game_ini, "INSTALL", "BasePath")
-                if had_base and original_base.strip():
-                    base_path = Path(original_base.strip())
-                    redirect_hint = base_path if base_path.is_absolute() else ctx.game_dir / base_path
-                    if redirect_hint.is_dir():
-                        _prepare_managed_path(ctx, redirect_hint / ctx.reshade_dll_name)
-                        _prepare_managed_path(ctx, redirect_hint / "ReShade.ini")
-                _prepare_managed_path(ctx, game_ini)
-                game_ini.unlink()
-            else:
-                _prepare_managed_path(ctx, game_ini)
-
+    def execute(self, ctx: RenoDxContext) -> bool:
+        game_ini = ctx.reshade_dir / "ReShade.ini"
+        if ctx.need_reshade:
+            if not ctx.reshade_bundle or not ctx.reshade_bundle.setup_exe_path:
+                ctx.error_message = "ReShade Addon installer bundle is missing."
+                return False
             _prepare_reshade_runtime_artifacts(ctx)
-            if not reshade_headless_install(ctx.reshade_bundle.setup_exe_path, ctx.game_exe, ctx.reshade_api):
-                bitness_key = "reshade32.dll" if ctx.is_32bit else "reshade64.dll"
-                if not _install_reshade_from_extraction(
-                    ctx, ctx.reshade_bundle.setup_exe_path, primary_dll, game_ini, bitness_key
-                ):
-                    ctx.error_message = (
-                        "ReShade unattended setup failed and direct extraction could not create the runtime."
-                    )
-                    return False
-
-            reshade_dll = ctx.game_dir / ctx.reshade_dll_name
-            if not reshade_dll.is_file() and game_ini.is_file():
-                had, base = ini_get_exact(game_ini, "INSTALL", "BasePath")
-                if had and base.strip():
-                    base_path = Path(base.strip())
-                    redirected = base_path if base_path.is_absolute() else ctx.game_dir / base_path
-                    if redirected.is_dir():
-                        ctx.reshade_dir = redirected.resolve()
-                        logger.info(f"ReShade redirected install to: {ctx.reshade_dir}")
-
-            if not _relocate_redirected_d3d9_reshade(ctx, game_ini):
+            bitness_key = "reshade32.dll" if ctx.is_32bit else "reshade64.dll"
+            if not _install_reshade_from_extraction(
+                ctx, ctx.reshade_bundle.setup_exe_path, ctx.reshade_dir / ctx.reshade_dll_name, game_ini, bitness_key
+            ):
+                ctx.error_message = "ReShade extraction could not create the required runtime."
                 return False
-
             ctx.record.reshade_by_us = True
-            ctx.record.reshade_dir = str(ctx.reshade_dir)
-
-            target_dll = ctx.reshade_dir / ctx.reshade_dll_name
-            if not target_dll.is_file():
-                ctx.error_message = f"ReShade setup completed without creating {ctx.reshade_dll_name}."
-                return False
-            managed_dll = _prepare_managed_path(ctx, target_dll)
-            managed_dll.size_bytes = target_dll.stat().st_size
-            managed_dll.sha256 = sha256_file(target_dll)
-            if ctx.reshade_dir != ctx.game_dir:
-                redirected_ini = ctx.reshade_dir / "ReShade.ini"
-                managed_ini = _prepare_managed_path(ctx, redirected_ini)
-                if redirected_ini.is_file():
-                    managed_ini.size_bytes = redirected_ini.stat().st_size
-                    managed_ini.sha256 = sha256_file(redirected_ini)
-        else:
-            ctx.record.reshade_dir = str(ctx.reshade_dir)
-            logger.info("Existing ReShade installation detected and preserved.")
-
-        if not normalize_search_paths(ctx.reshade_dir / "ReShade.ini", ctx.record):
+        ctx.record.reshade_dir = ctx.reshade_dir.as_posix()
+        if not normalize_search_paths(game_ini, ctx.record):
             ctx.error_message = "Could not normalize the ReShade search paths."
             return False
         return True
 
 
-class StepInstallD3D9Translation(PipelineStep):
+class StepInstallD3D9Translation(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
         return "InstallD3D9Translation"
@@ -458,7 +339,7 @@ class StepInstallD3D9Translation(PipelineStep):
     def description(self) -> str:
         return "Configures dgVoodoo2 D3D9->D3D11 translation layer"
 
-    def execute(self, ctx: PipelineContext) -> bool:
+    def execute(self, ctx: RenoDxContext) -> bool:
         if not ctx.d3d9_translate or not ctx.dgvoodoo_bundle:
             return True
 
@@ -490,7 +371,7 @@ class StepInstallD3D9Translation(PipelineStep):
         return True
 
 
-class StepInjectFeederAndHeaders(PipelineStep):
+class StepInjectFeederAndHeaders(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
         return "InjectFeederAndHeaders"
@@ -499,7 +380,7 @@ class StepInjectFeederAndHeaders(PipelineStep):
     def description(self) -> str:
         return "Installs shader headers and DLSS5-Feeder only when the game has no native DLSS"
 
-    def execute(self, ctx: PipelineContext) -> bool:
+    def execute(self, ctx: RenoDxContext) -> bool:
         if not ctx.headers_bundle:
             if not ctx.install_feeder and not ctx.install_lumenite:
                 return True
@@ -508,6 +389,8 @@ class StepInjectFeederAndHeaders(PipelineStep):
 
         shaders_dir = ctx.reshade_dir / "reshade-shaders" / "Shaders"
         if ctx.install_feeder:
+            for name in ("dlss5-feed.cfg", "dlss5-feed.log"):
+                _prepare_managed_path(ctx, ctx.reshade_dir / name)
             if not ctx.feeder_bundle:
                 ctx.error_message = "Feeder bundle missing."
                 return False
@@ -529,7 +412,7 @@ class StepInjectFeederAndHeaders(PipelineStep):
         return True
 
 
-class StepInjectRenoDxAndNgx(PipelineStep):
+class StepInjectRenoDxAndNgx(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
         return "InjectRenoDxAndNgx"
@@ -538,7 +421,7 @@ class StepInjectRenoDxAndNgx(PipelineStep):
     def description(self) -> str:
         return "Installs RenoDX DLSS 5 add-on and NVIDIA DLSS NR/SR binaries"
 
-    def execute(self, ctx: PipelineContext) -> bool:
+    def execute(self, ctx: RenoDxContext) -> bool:
         if not ctx.renodx_bundle or not ctx.ngx_bundle or (ctx.install_feeder and not ctx.feeder_bundle):
             ctx.error_message = "RenoDX or NGX bundle missing."
             return False
@@ -548,6 +431,9 @@ class StepInjectRenoDxAndNgx(PipelineStep):
                 ctx.error_message = "Feeder bundle missing for the 32-bit host."
                 return False
             host_dir = ctx.reshade_dir / "host64"
+            track_created_directories(ctx.record, host_dir)
+            _prepare_managed_path(ctx, host_dir / "dlss5-feed-host.log")
+            prepare_runtime_artifacts(ctx.record, host_dir, "dlss5-feed-host64*.png")
             host_dir.mkdir(parents=True, exist_ok=True)
             if ctx.feeder_bundle.host64_exe:
                 _place_file(ctx, ctx.feeder_bundle.host64_exe, host_dir / "dlss5-feed-host64.exe")
@@ -557,17 +443,12 @@ class StepInjectRenoDxAndNgx(PipelineStep):
                 host_ini = host_dir / "ReShade.ini"
                 managed_host_dll = _prepare_managed_path(ctx, host_dxgi)
                 _prepare_managed_path(ctx, host_ini)
-                installed = reshade_headless_install(
-                    ctx.reshade_bundle.setup_exe_path, host_dir / "dlss5-feed-host64.exe", ctx.reshade_api
-                )
-                if (not installed or not host_dxgi.is_file()) and not _install_reshade_from_extraction(
-                    ctx,
-                    ctx.reshade_bundle.setup_exe_path,
-                    host_dxgi,
-                    host_ini,
-                    "reshade64.dll",
+                for name in _RESHADER_RUNTIME_ARTIFACTS:
+                    _prepare_managed_path(ctx, host_dir / name)
+                if not _install_reshade_from_extraction(
+                    ctx, ctx.reshade_bundle.setup_exe_path, host_dxgi, host_ini, "reshade64.dll"
                 ):
-                    ctx.error_message = f"Host ReShade setup did not create {ctx.reshade_dll_name}."
+                    ctx.error_message = "Could not install 64-bit ReShade runtime for the feeder host."
                     return False
                 managed_host_dll.size_bytes = host_dxgi.stat().st_size
                 managed_host_dll.sha256 = sha256_file(host_dxgi)
@@ -588,12 +469,8 @@ class StepInjectRenoDxAndNgx(PipelineStep):
 
         return True
 
-    def rollback(self, ctx: PipelineContext) -> None:
-        if ctx.is_32bit:
-            remove_dir_if_empty(ctx.reshade_dir / "host64")
 
-
-class StepConfigureMotionVectors(PipelineStep):
+class StepConfigureMotionVectors(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
         return "ConfigureMotionVectors"
@@ -602,7 +479,7 @@ class StepConfigureMotionVectors(PipelineStep):
     def description(self) -> str:
         return "Installs optional LumeniteFX motion vectors and configures DLSS5-Feeder when used"
 
-    def execute(self, ctx: PipelineContext) -> bool:
+    def execute(self, ctx: RenoDxContext) -> bool:
         if ctx.install_lumenite and ctx.lumenite_bundle and ctx.lumenite_bundle.staging_dir:
             logger.info("Placing LumeniteFX shaders into reshade-shaders layout...")
             for src in ctx.lumenite_bundle.files:
@@ -630,7 +507,7 @@ class StepConfigureMotionVectors(PipelineStep):
         return True
 
 
-class StepInstallVulkanLayer(PipelineStep):
+class StepInstallVulkanLayer(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
         return "InstallVulkanLayer"
@@ -639,7 +516,7 @@ class StepInstallVulkanLayer(PipelineStep):
     def description(self) -> str:
         return "Extracts Vulkan layer fallback binaries if requested"
 
-    def execute(self, ctx: PipelineContext) -> bool:
+    def execute(self, ctx: RenoDxContext) -> bool:
         if not ctx.install_feeder:
             if ctx.install_vulkan_layer:
                 logger.warning("Ignoring --vulkan-layer because the native DLSS path does not use DLSS5-Feeder.")
@@ -667,7 +544,7 @@ class StepInstallVulkanLayer(PipelineStep):
         return True
 
 
-class StepMirrorDualLocations(PipelineStep):
+class StepMirrorDualLocations(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
         return "MirrorDualLocations"
@@ -676,7 +553,7 @@ class StepMirrorDualLocations(PipelineStep):
     def description(self) -> str:
         return "Mirrors placed files into bin/ subfolder for Source engine D3D9 games"
 
-    def execute(self, ctx: PipelineContext) -> bool:
+    def execute(self, ctx: RenoDxContext) -> bool:
         if ctx.d3d9_translate:
             alt_bin = ctx.game_dir / "bin"
             if alt_bin.is_dir() and alt_bin != ctx.reshade_dir:
@@ -684,19 +561,24 @@ class StepMirrorDualLocations(PipelineStep):
                 for recorded in list(ctx.record.files):
                     p = Path(recorded.path)
                     try:
-                        if p.is_file() and p.is_relative_to(ctx.reshade_dir):
+                        if p.is_relative_to(ctx.reshade_dir) and not p.is_relative_to(alt_bin):
                             rel = p.relative_to(ctx.reshade_dir)
                             dst = alt_bin / rel
-                            _place_file(ctx, p, dst)
-                            mirrored += 1
+                            if p.is_file():
+                                _place_file(ctx, p, dst)
+                                mirrored += 1
+                            else:
+                                _prepare_managed_path(ctx, dst)
                     except Exception as error:
                         ctx.error_message = f"Could not mirror {p.name} into bin/: {error}"
                         return False
+                if ctx.is_32bit and ctx.install_feeder:
+                    prepare_runtime_artifacts(ctx.record, alt_bin / "host64", "dlss5-feed-host64*.png")
                 logger.info(f"Mirrored {mirrored} files into bin/ directory.")
         return True
 
 
-class StepConfigureWineOverrides(PipelineStep):
+class StepConfigureWineOverrides(PipelineStep[RenoDxContext]):
     @property
     def name(self) -> str:
         return "ConfigureWineOverrides"
@@ -705,7 +587,7 @@ class StepConfigureWineOverrides(PipelineStep):
     def description(self) -> str:
         return "Configures Wine/Proton registry DLL overrides for custom runtime hooks"
 
-    def execute(self, ctx: PipelineContext) -> bool:
+    def execute(self, ctx: RenoDxContext) -> bool:
         prefix_info = ProtonManager.find_prefix_for_game(ctx.game_exe)
         ctx.record.platform = get_platform_adapter().platform_name
 
@@ -741,29 +623,4 @@ class StepConfigureWineOverrides(PipelineStep):
                 f"Configured Proton/Wine DLL overrides in {prefix_info.user_reg_path.name}: {', '.join(injected)}"
             )
 
-        return True
-
-
-class StepSaveRecord(PipelineStep):
-    @property
-    def name(self) -> str:
-        return "SaveRecord"
-
-    @property
-    def description(self) -> str:
-        return "Persists dlss5-enabler.install.json and registers the game in the global install index"
-
-    def execute(self, ctx: PipelineContext) -> bool:
-        rec_ok = record_save(ctx.record)
-        if not rec_ok:
-            ctx.error_message = "Could not save the per-game install record."
-            return False
-        idx_ok = index_add(ctx.record)
-        if not idx_ok:
-            record_path = ctx.record.record_path()
-            with resource_lock(record_path):
-                record_path.unlink(missing_ok=True)
-            ctx.error_message = "Could not update the global install index."
-            return False
-        logger.info(f"Install record saved: {ctx.record.record_path()} ({len(ctx.record.files)} files recorded)")
         return True

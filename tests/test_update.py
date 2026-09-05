@@ -5,8 +5,10 @@ from pathlib import Path
 import pytest
 from pytest_mock import MockerFixture
 
-from dlss5_enabler.core.record import InstallOptions, InstallRecord
+from dlss5_enabler.core.record import CURRENT_RECORD_SCHEMA_VERSION, InstallOptions, InstallRecord
+from dlss5_enabler.operations.pipeline import PipelineResult, PipelineStatus
 from dlss5_enabler.operations.update import GameUpdateStatus, run_update
+from dlss5_enabler.schemas.strategy import InstallStrategy
 
 
 def _write_record(
@@ -45,7 +47,9 @@ def test_update_replays_saved_options_from_directory(
     game_exe.write_bytes(b"MZ")
     _write_record(game_exe, tool_version="1.0.0", options=options)
     mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.1.0")
-    install = mocker.patch("dlss5_enabler.operations.update._run_install_unlocked", return_value=True)
+    install = mocker.patch(
+        "dlss5_enabler.operations.update._run_install_unlocked", return_value=PipelineResult(PipelineStatus.COMPLETED)
+    )
 
     result = run_update(tmp_path, force_download=True, verbose=True)
 
@@ -58,6 +62,7 @@ def test_update_replays_saved_options_from_directory(
         install_vulkan_layer=options.vulkan_layer,
         force_download=True,
         verbose=True,
+        strategy=InstallStrategy.RENODX,
     )
 
 
@@ -82,7 +87,9 @@ def test_reinstall_reapplies_equal_version(tmp_path: Path, mocker: MockerFixture
     game_exe.write_bytes(b"MZ")
     _write_record(game_exe, tool_version="1.1.0")
     mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.1.0")
-    install = mocker.patch("dlss5_enabler.operations.update._run_install_unlocked", return_value=True)
+    install = mocker.patch(
+        "dlss5_enabler.operations.update._run_install_unlocked", return_value=PipelineResult(PipelineStatus.COMPLETED)
+    )
 
     result = run_update(game_exe, reinstall=True)
 
@@ -109,7 +116,9 @@ def test_unknown_legacy_version_can_be_updated(tmp_path: Path, mocker: MockerFix
     game_exe.write_bytes(b"MZ")
     _write_record(game_exe, tool_version="legacy")
     mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.1.0")
-    install = mocker.patch("dlss5_enabler.operations.update._run_install_unlocked", return_value=True)
+    install = mocker.patch(
+        "dlss5_enabler.operations.update._run_install_unlocked", return_value=PipelineResult(PipelineStatus.COMPLETED)
+    )
     messages: list[str] = []
 
     result = run_update(game_exe, log=messages.append)
@@ -150,8 +159,7 @@ def test_unknown_future_record_schema_is_preserved(tmp_path: Path, mocker: Mocke
     game_exe.write_bytes(b"MZ")
     record = _write_record(game_exe, tool_version="2.0.0")
     record_path = record.record_path()
-    future = record_path.read_text(encoding="utf-8").replace('"schema_version":2', '"schema_version":3')
-    assert '"schema_version":3' in future
+    future = record.model_copy(update={"schema_version": CURRENT_RECORD_SCHEMA_VERSION + 1}).model_dump_json()
     record_path.write_text(future, encoding="utf-8")
     install = mocker.patch("dlss5_enabler.operations.update._run_install_unlocked")
 
@@ -168,7 +176,9 @@ def test_install_failure_reports_restoration(tmp_path: Path, mocker: MockerFixtu
     record = _write_record(game_exe, tool_version="1.0.0")
     original = record.record_path().read_bytes()
     mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.1.0")
-    mocker.patch("dlss5_enabler.operations.update._run_install_unlocked", return_value=False)
+    mocker.patch(
+        "dlss5_enabler.operations.update._run_install_unlocked", return_value=PipelineResult(PipelineStatus.FAILED)
+    )
 
     result = run_update(game_exe)
 
@@ -189,7 +199,48 @@ def test_update_acquires_the_game_operation_lock_once(tmp_path: Path, mocker: Mo
 
     mocker.patch("dlss5_enabler.operations.update.resource_lock", side_effect=track_lock)
     mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.1.0")
-    mocker.patch("dlss5_enabler.operations.update._run_install_unlocked", return_value=True)
+    mocker.patch(
+        "dlss5_enabler.operations.update._run_install_unlocked", return_value=PipelineResult(PipelineStatus.COMPLETED)
+    )
 
     assert run_update(game_exe).success
     assert lock_targets == [tmp_path / ".dlss5-enabler-install-operation"]
+
+
+@pytest.mark.parametrize("status", [PipelineStatus.FAILED, PipelineStatus.RECOVERY_FAILED])
+def test_update_only_claims_restoration_when_recovery_succeeded(
+    tmp_path: Path, mocker: MockerFixture, status: PipelineStatus
+) -> None:
+    exe = tmp_path / "game.exe"
+    exe.write_bytes(b"MZ")
+    _write_record(exe, tool_version="1.0.0")
+    mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.2.0")
+    incomplete = status is PipelineStatus.RECOVERY_FAILED
+    installation = PipelineResult(
+        status,
+        message="simulated install failure",
+        recovery_errors=("locked user file",) if incomplete else (),
+        recovery_path=tmp_path / "recovery" if incomplete else None,
+    )
+    mocker.patch("dlss5_enabler.operations.update._run_install_unlocked", return_value=installation)
+    result = run_update(exe)
+    assert not result.success
+    assert result.installation == installation
+    assert ("was restored" in result.message) is not incomplete
+    if incomplete:
+        assert result.status is GameUpdateStatus.RECOVERY_FAILED
+        assert "locked user file" in result.message
+        assert str(tmp_path / "recovery") in result.message
+
+
+def test_update_reports_active_installation_with_pending_cleanup(tmp_path: Path, mocker: MockerFixture) -> None:
+    exe = tmp_path / "game.exe"
+    exe.write_bytes(b"MZ")
+    _write_record(exe, tool_version="1.0.0")
+    mocker.patch("dlss5_enabler.operations.update.get_tool_version", return_value="1.2.0")
+    installation = PipelineResult(PipelineStatus.CLEANUP_PENDING, cleanup_errors=("snapshot is locked",))
+    mocker.patch("dlss5_enabler.operations.update._run_install_unlocked", return_value=installation)
+    result = run_update(exe)
+    assert result.success
+    assert "cleanup pending" in result.message
+    assert "snapshot is locked" in result.message

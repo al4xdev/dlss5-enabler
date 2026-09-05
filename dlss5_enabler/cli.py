@@ -392,6 +392,7 @@ def info_cmd(
         table.add_row("Current CLI Version", current_version)
         table.add_row("Install Status", _version_status_markup(status))
         table.add_row("Record Schema", str(rec.schema_version))
+        table.add_row("Installed Engine", rec.strategy.value)
         table.add_row(
             "Saved Options",
             f"Lumenite={'Yes' if options.lumenite else 'No'}, "

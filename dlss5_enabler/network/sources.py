@@ -83,6 +83,7 @@ def _binary(path: Path, name: str, resolved: ResolvedArtifact) -> BinaryInfo:
         sha256=sha256_file(path),
         size_bytes=path.stat().st_size,
         source_url=resolved.url,
+        source_revision=resolved.revision,
     )
 
 

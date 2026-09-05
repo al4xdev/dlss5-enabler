@@ -1,18 +1,26 @@
+import base64
+import json
 import shutil
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
-from dlss5_enabler.core.fileio import atomic_copy_file, resource_lock
+from dlss5_enabler.core.fileio import atomic_copy_file, atomic_write_text, resource_lock
 from dlss5_enabler.core.ini import ini_set_exact
-from dlss5_enabler.core.record import InstallRecord, RecordedFile, index_add, index_remove, record_load
-from dlss5_enabler.core.util import remove_dir_if_empty
+from dlss5_enabler.core.record import (
+    IndexEntrySnapshot,
+    InstallRecord,
+    RecordedFile,
+    capture_index_entry,
+    index_remove,
+    record_load,
+    restore_index_entry,
+)
 from dlss5_enabler.platform import get_platform_adapter
 from dlss5_enabler.platform.proton import ProtonManager, WineRegParser
 
-LogFn = Callable[[str], None] | Any
+LogFn = Callable[[str], object]
 
 
 @dataclass
@@ -20,6 +28,10 @@ class InstallSnapshot:
     root: Path
     record: InstallRecord
     files: dict[str, Path]
+    missing_files: list[str] = field(default_factory=list[str])
+    directories: list[str] = field(default_factory=list[str])
+    index_entry: IndexEntrySnapshot | None = None
+    recovery_errors: list[str] = field(default_factory=list[str])
 
 
 def _recorded_files(rec: InstallRecord) -> list[RecordedFile]:
@@ -35,9 +47,35 @@ def _recorded_files(rec: InstallRecord) -> list[RecordedFile]:
     return [selected[key] for key in reversed(order)]
 
 
-def _feeder_host_runtime_artifacts(rec: InstallRecord) -> list[Path]:
-    host_dir = rec.effective_reshade_dir() / "host64"
-    return [host_dir / "dlss5-feed-host.log", *host_dir.glob("dlss5-feed-host64*.png")]
+def _runtime_artifacts(rec: InstallRecord) -> list[Path]:
+    recorded = {Path(item.path).resolve() for item in rec.files}
+    roots = {Path(rec.game_dir).resolve(), rec.effective_reshade_dir().resolve()}
+    if rec.d3d9_translate:
+        roots.add((Path(rec.game_dir) / "bin").resolve())
+    allowed = roots | {root / "host64" for root in roots}
+    found: set[Path] = set()
+    for rule in rec.runtime_artifacts:
+        directory = Path(rule.directory)
+        if directory.is_symlink() or directory.resolve() not in allowed:
+            raise ValueError(f"Runtime artifact directory is outside the managed installation: {directory}")
+        if not rule.pattern or rule.pattern in {".", ".."} or any(token in rule.pattern for token in ("/", "\\", "**")):
+            raise ValueError(f"Invalid runtime artifact pattern: {rule.pattern}")
+        preexisting = {Path(path).resolve() for path in rule.preexisting}
+        for path in directory.glob(rule.pattern):
+            resolved = path.resolve()
+            if not path.is_symlink() and path.is_file() and resolved not in preexisting | recorded:
+                found.add(path)
+    return sorted(found)
+
+
+def _capture_file(path: Path, saved: Path) -> bool:
+    with resource_lock(path):
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ValueError(f"Recovery snapshot requires a regular file: {path}")
+        if not path.exists():
+            return False
+        shutil.copy2(path, saved)
+        return True
 
 
 def capture_install_snapshot(rec: InstallRecord) -> InstallSnapshot:
@@ -48,44 +86,147 @@ def capture_install_snapshot(rec: InstallRecord) -> InstallSnapshot:
         paths.extend(Path(item.path) for item in rec.ini_touched)
         paths.extend(Path(item.reg_path) for item in rec.registry_touched)
         paths.append(rec.record_path())
-        reshade_dir = rec.effective_reshade_dir()
-        paths.extend(reshade_dir / name for name in ["ReShade.log", "ReShade.ini.bak", "dxgi.log"])
-        paths.extend(_feeder_host_runtime_artifacts(rec))
+        paths.extend(_runtime_artifacts(rec))
         files: dict[str, Path] = {}
+        missing_files: list[str] = []
         for path in paths:
-            resolved = str(path.resolve())
-            if resolved in files or not path.is_file():
+            resolved = path.resolve().as_posix()
+            if resolved in files or resolved in missing_files:
                 continue
             saved = root / str(len(files))
-            with resource_lock(path):
-                shutil.copy2(path, saved)
-            files[resolved] = saved
-        return InstallSnapshot(root=root, record=rec.model_copy(deep=True), files=files)
+            if _capture_file(path, saved):
+                files[resolved] = saved
+            else:
+                missing_files.append(resolved)
+        directories = [Path(path).resolve().as_posix() for path in rec.created_directories if Path(path).is_dir()]
+        index_entry = capture_index_entry(rec.game_dir)
+        snapshot = InstallSnapshot(
+            root=root,
+            record=rec.model_copy(deep=True),
+            files=files,
+            missing_files=missing_files,
+            directories=directories,
+            index_entry=index_entry,
+        )
+        atomic_write_text(
+            root / "recovery.json",
+            json.dumps(
+                {
+                    "snapshot_version": 1,
+                    "record": rec.model_dump(mode="json"),
+                    "files": {original: saved.name for original, saved in files.items()},
+                    "missing_files": missing_files,
+                    "directories": directories,
+                    "index_entry": {
+                        "game_dir": index_entry.game_dir,
+                        "entry": index_entry.entry.model_dump(mode="json") if index_entry.entry else None,
+                        "original_bytes": (
+                            base64.b64encode(index_entry.original_bytes).decode("ascii")
+                            if index_entry.original_bytes is not None
+                            else None
+                        ),
+                        "position": index_entry.position,
+                    },
+                },
+                indent=2,
+            ),
+        )
+        return snapshot
     except Exception:
-        shutil.rmtree(root, ignore_errors=True)
+        cleanup_install_snapshot(InstallSnapshot(root=root, record=rec, files={}))
         raise
 
 
 def cleanup_install_snapshot(snapshot: InstallSnapshot) -> None:
-    shutil.rmtree(snapshot.root, ignore_errors=True)
+    root = snapshot.root.resolve()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if root.parent != temp_root or not root.name.startswith("dlss5-enabler-install-snapshot-"):
+        raise ValueError(f"Refusing to remove an invalid recovery snapshot directory: {root}")
+    if root.exists():
+        shutil.rmtree(root)
 
 
-def restore_install_snapshot(snapshot: InstallSnapshot) -> bool:
-    try:
-        for original, saved in snapshot.files.items():
+def restore_install_snapshot(snapshot: InstallSnapshot, *, cleanup: bool = True) -> bool:
+    snapshot.recovery_errors.clear()
+    for original in snapshot.missing_files:
+        try:
+            with resource_lock(original):
+                Path(original).unlink(missing_ok=True)
+        except Exception as error:
+            snapshot.recovery_errors.append(f"Could not restore absence of {original}: {error}")
+    for directory in snapshot.directories:
+        try:
+            Path(directory).mkdir(parents=True, exist_ok=True)
+        except Exception as error:
+            snapshot.recovery_errors.append(f"Could not restore directory {directory}: {error}")
+    for original, saved in snapshot.files.items():
+        try:
             atomic_copy_file(saved, Path(original))
-        if not index_add(snapshot.record):
-            return False
-        cleanup_install_snapshot(snapshot)
+        except Exception as error:
+            snapshot.recovery_errors.append(f"Could not restore {original}: {error}")
+    if snapshot.index_entry is None or not restore_index_entry(snapshot.record.game_dir, snapshot.index_entry):
+        snapshot.recovery_errors.append("Could not restore the previous global index entry.")
+    if snapshot.recovery_errors:
+        return False
+    if not cleanup:
         return True
-    except Exception:
+    try:
+        cleanup_install_snapshot(snapshot)
+    except Exception as error:
+        snapshot.recovery_errors.append(f"Could not remove the completed recovery snapshot: {error}")
+        return False
+    return True
+
+
+def _validate_backups(rec: InstallRecord, log: LogFn) -> bool:
+    for item in _recorded_files(rec):
+        path = Path(item.path)
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            log(f"Cannot restore a destination that is not a regular file: {path}")
+            return False
+        if item.backup and (not Path(item.backup).is_file() or Path(item.backup).is_symlink()):
+            log(f"Backup missing or not a regular file for {path.name}: {item.backup}")
+            return False
+    return True
+
+
+def _restore_recorded_file(item: RecordedFile, log: LogFn) -> bool:
+    path = Path(item.path)
+    try:
+        if item.backup:
+            backup = Path(item.backup)
+            atomic_copy_file(backup, path)
+            backup.unlink()
+            log(f"Restored backup -> {path.name}")
+        else:
+            with resource_lock(path):
+                path.unlink(missing_ok=True)
+            log(f"Removed {path.name}")
+        return True
+    except Exception as error:
+        log(f"Could not restore {path.name}: {error}")
         return False
 
 
+def _cleanup_created_directories(rec: InstallRecord) -> None:
+    for directory in sorted(
+        {Path(path) for path in rec.created_directories}, key=lambda path: len(path.parts), reverse=True
+    ):
+        if directory.is_symlink():
+            continue
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+
+
 def revert_record_mutations(rec: InstallRecord, log: LogFn = print) -> bool:
+    if not _validate_backups(rec, log):
+        return False
     success = True
+    recorded_paths = {Path(item.path).resolve() for item in rec.files}
     for ini_touch in reversed(rec.ini_touched):
         ini_path = Path(ini_touch.path)
+        if ini_path.resolve() in recorded_paths:
+            continue
         if ini_path.is_file():
             if ini_set_exact(ini_path, ini_touch.section, ini_touch.key, ini_touch.original):
                 log(f"Restored {ini_touch.key} in {ini_path.name}")
@@ -107,72 +248,40 @@ def revert_record_mutations(rec: InstallRecord, log: LogFn = print) -> bool:
             success = False
 
     for item in _recorded_files(rec):
-        path = Path(item.path)
-        if path.exists():
-            try:
-                path.unlink()
-                log(f"Removed {path.name}")
-            except Exception as error:
-                log(f"Could not remove {path.name} (locked?): {error}")
-                success = False
-                continue
-        if item.backup:
-            backup = Path(item.backup)
-            if backup.is_file():
-                try:
-                    atomic_copy_file(backup, path)
-                    backup.unlink()
-                    log(f"Restored backup -> {path.name}")
-                except Exception as error:
-                    log(f"Could not restore backup for {path.name}: {error}")
-                    success = False
-            else:
-                log(f"Backup missing for {path.name}: {backup}")
-                success = False
+        if not _restore_recorded_file(item, log):
+            success = False
+    if success:
+        try:
+            for artifact in _runtime_artifacts(rec):
+                with resource_lock(artifact):
+                    artifact.unlink(missing_ok=True)
+            _cleanup_created_directories(rec)
+        except Exception as error:
+            log(f"Could not remove managed runtime artifacts or directories: {error}")
+            success = False
     return success
 
 
-def _cleanup_empty_directories(rec: InstallRecord, game_dir: Path) -> None:
-    reshade_dir = rec.effective_reshade_dir()
-    for directory in [
-        reshade_dir / "reshade-shaders" / "Shaders" / "include",
-        reshade_dir / "reshade-shaders" / "Shaders",
-        reshade_dir / "reshade-shaders" / "Textures",
-        reshade_dir / "reshade-shaders",
-        reshade_dir / "host64",
-        game_dir / "reshade-shaders" / "Shaders" / "include",
-        game_dir / "reshade-shaders" / "Shaders",
-        game_dir / "reshade-shaders" / "Textures",
-        game_dir / "reshade-shaders",
-        game_dir / "host64",
-    ]:
-        remove_dir_if_empty(directory)
+def _recover_failed_uninstall(snapshot: InstallSnapshot, log: LogFn) -> None:
+    if restore_install_snapshot(snapshot):
+        log("The previous installation state was restored.")
+    else:
+        for error in snapshot.recovery_errors:
+            log(error)
+        log(f"Automatic recovery is incomplete. Recovery files and recovery.json were retained at {snapshot.root}.")
 
 
 def _finalize_uninstall(rec: InstallRecord, game_dir: Path, snapshot: InstallSnapshot, log: LogFn) -> bool:
-    reshade_dir = rec.effective_reshade_dir()
-    if rec.reshade_by_us:
-        extras = [reshade_dir / name for name in ["ReShade.log", "ReShade.ini.bak", "dxgi.log"]]
-        extras.extend(_feeder_host_runtime_artifacts(rec))
-        for extra in extras:
-            if extra.is_file():
-                try:
-                    extra.unlink()
-                except Exception as error:
-                    restore_install_snapshot(snapshot)
-                    log(f"Could not remove {extra.name}: {error}")
-                    return False
-    _cleanup_empty_directories(rec, game_dir)
     if not index_remove(game_dir):
-        restore_install_snapshot(snapshot)
-        log("Could not update the global install index; install record was preserved.")
+        _recover_failed_uninstall(snapshot, log)
+        log("Could not update the global install index.")
         return False
     rec_file = rec.record_path()
     try:
         with resource_lock(rec_file):
             rec_file.unlink(missing_ok=True)
     except Exception as error:
-        restore_install_snapshot(snapshot)
+        _recover_failed_uninstall(snapshot, log)
         log(f"Could not remove install record: {error}")
         return False
     return True
@@ -188,6 +297,9 @@ def run_uninstall(game_dir_or_exe: Path | str, log: LogFn = print, lock_operatio
 
 
 def _handle_missing_install_record(game_dir: Path, log: LogFn) -> bool:
+    if (game_dir / "dlss5-enabler.install.json").exists():
+        log(f"The install record in {game_dir} could not be read or validated; installation and index were preserved.")
+        return False
     if not index_remove(game_dir):
         log(f"No install record found in {game_dir}, and the stale index entry could not be removed.")
         return False
@@ -195,15 +307,32 @@ def _handle_missing_install_record(game_dir: Path, log: LogFn) -> bool:
     return True
 
 
-def _run_uninstall_unlocked(game_dir: Path, log: LogFn) -> bool:
-    rec = record_load(game_dir)
-    if not rec:
-        return _handle_missing_install_record(game_dir, log)
+def _can_uninstall(rec: InstallRecord, game_dir: Path, log: LogFn) -> bool:
+    if Path(rec.game_dir).resolve() != game_dir:
+        log("The install record belongs to another directory; no files were changed.")
+        return False
     game_exe = Path(rec.game_exe)
     if not game_exe.is_absolute():
         game_exe = game_dir / game_exe
     if get_platform_adapter().is_game_running(game_exe):
         log(f"Cannot uninstall while {game_exe.name} is running. Close the game and try again.")
+        return False
+    return True
+
+
+def _revert_for_uninstall(rec: InstallRecord, log: LogFn) -> bool:
+    try:
+        return revert_record_mutations(rec, log)
+    except Exception as error:
+        log(f"Unexpected failure while reverting installation mutations: {error}")
+        return False
+
+
+def _run_uninstall_unlocked(game_dir: Path, log: LogFn) -> bool:
+    rec = record_load(game_dir)
+    if not rec:
+        return _handle_missing_install_record(game_dir, log)
+    if not _can_uninstall(rec, game_dir, log):
         return False
 
     log(f"Uninstalling DLSS5 Enabler files from {game_dir}...")
@@ -212,14 +341,18 @@ def _run_uninstall_unlocked(game_dir: Path, log: LogFn) -> bool:
     except Exception as error:
         log(f"Could not create uninstall recovery snapshot: {error}")
         return False
-    if not revert_record_mutations(rec, log):
-        restore_install_snapshot(snapshot)
-        log("Uninstall incomplete; install record was preserved for recovery.")
+    if not _revert_for_uninstall(rec, log):
+        _recover_failed_uninstall(snapshot, log)
+        log("Uninstall incomplete.")
         return False
 
     if not _finalize_uninstall(rec, game_dir, snapshot, log):
         return False
 
-    cleanup_install_snapshot(snapshot)
-    log("Uninstall completed successfully.")
+    try:
+        cleanup_install_snapshot(snapshot)
+    except Exception as error:
+        log(f"Uninstall completed, but recovery snapshot cleanup failed at {snapshot.root}: {error}")
+    else:
+        log("Uninstall completed successfully.")
     return True
